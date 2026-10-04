@@ -1,147 +1,171 @@
-name: 编译
+name: Cross Build
 
 on:
   workflow_dispatch:
     inputs:
-      system:
+      systems:
+        description: 'Target system(s)'
         type: choice
-        options: [L, W, M, Android, all-system]
-        default: L
-      arch:
+        default: linux
+        options: [linux, windows, macos, bsd, android, allsystem]
+      archs:
+        description: 'Target arch(s)'
         type: choice
-        options: [x86_64, aarch64, armv7, riscv64, loong64, mips, mipsel, all-arch]
         default: x86_64
+        options: [x86_64, aarch64, armv7, x86, allarch]
+
+env:
+  BIN: myapp   # 改成你的二进制名
 
 jobs:
-  gen:
+  # ---------- Linux / Windows / BSD / Android (Linux runner) ----------
+  non-macos:
     runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.g.outputs.matrix }}
     steps:
-      - id: g
-        shell: bash
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tools
         run: |
-          SYS="${{ inputs.system }}"; ARCH="${{ inputs.arch }}"
-          # 各平台允许的架构
-          L_ARCH=(x86_64 aarch64 armv7 riscv64 loong64 mips mipsel)
-          W_ARCH=(x86_64 aarch64)
-          M_ARCH=(x86_64 aarch64)
-          A_ARCH=(x86_64 aarch64 armv7)
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf mingw-w64 zig
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf \
+                           x86_64-pc-windows-gnu aarch64-pc-windows-gnu i686-pc-windows-gnu \
+                           x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf \
+                           i686-unknown-linux-musl \
+                           x86_64-unknown-freebsd aarch64-unknown-freebsd i686-unknown-freebsd
 
-          case "$SYS" in
-            all-system) SYS_ARR=(L W M Android);;
-            *) SYS_ARR=($SYS);;
-          esac
+      - name: Cargo config
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          [target.armv7-unknown-linux-gnueabihf]
+          linker = "arm-linux-gnueabihf-gcc"
+          [target.x86_64-pc-windows-gnu]
+          linker = "x86_64-w64-mingw32-gcc"
+          [target.aarch64-pc-windows-gnu]
+          linker = "aarch64-w64-mingw32-gcc"
+          [target.i686-pc-windows-gnu]
+          linker = "i686-w64-mingw32-gcc"
+          [target.x86_64-unknown-linux-musl]
+          linker = "musl-gcc"
+          [target.armv7-unknown-linux-musleabihf]
+          linker = "arm-linux-gnueabihf-gcc"
+          [target.x86_64-unknown-freebsd]
+          linker = "zig"
+          rustflags = ["-C","link-arg=-target","-C","link-arg=x86_64-freebsd"]
+          [target.aarch64-unknown-freebsd]
+          linker = "zig"
+          rustflags = ["-C","link-arg=-target","-C","link-arg=aarch64-freebsd"]
+          [target.i686-unknown-freebsd]
+          linker = "zig"
+          rustflags = ["-C","link-arg=-target","-C","link-arg=i686-freebsd"]
+          EOF
 
-          M="[]"
-          for s in "${SYS_ARR[@]}"; do
-            case $s in
-              L) ARRS=("${L_ARCH[@]}");;
-              W) ARRS=("${W_ARCH[@]}");;
-              M) ARRS=("${M_ARCH[@]}");;
-              Android) ARRS=("${A_ARCH[@]}");;
-            esac
-            if [ "$ARCH" = "all-arch" ]; then PICK=("${ARRS[@]}"); else PICK=("$ARCH"); fi
-            # 过滤非法组合
-            for a in "${PICK[@]}"; do
-              ok=0; for x in "${ARRS[@]}"; do [ "$x" = "$a" ] && ok=1; done
-              [ $ok -eq 1 ] && M=$(echo "$M" | jq ".+[{\"sys\":\"$s\",\"arch\":\"$a\"}]")
+      - name: Build matrix expand
+        id: m
+        run: |
+          SYS="${{ github.event.inputs.systems }}"
+          ARCH="${{ github.event.inputs.archs }}"
+          [ "$SYS" = "allsystem" ] && SYS="linux windows bsd android"
+          [ "$ARCH" = "allarch" ] && ARCH="x86_64 aarch64 armv7 x86"
+          echo "sys=$SYS" >> $GITHUB_OUTPUT
+          echo "arch=$ARCH" >> $GITHUB_OUTPUT
+
+      - name: Build
+        run: |
+          mkdir -p out
+          SYS="${{ steps.m.outputs.sys }}"
+          ARCH="${{ steps.m.outputs.arch }}"
+          for s in $SYS; do
+            for a in $ARCH; do
+              case "$s-$a" in
+                linux-x86_64)   T=x86_64-unknown-linux-gnu;   NAME=linux-x86_64;;
+                linux-aarch64)  T=aarch64-unknown-linux-gnu;  NAME=linux-aarch64;;
+                linux-armv7)    T=armv7-unknown-linux-gnueabihf; NAME=linux-armv7;;
+                linux-x86)      T=i686-unknown-linux-gnu;     NAME=linux-x86;;
+                windows-x86_64) T=x86_64-pc-windows-gnu;      NAME=windows-x86_64.exe;;
+                windows-aarch64)T=aarch64-pc-windows-gnu;     NAME=windows-aarch64.exe;;
+                windows-x86)    T=i686-pc-windows-gnu;        NAME=windows-x86.exe;;
+                bsd-x86_64)     T=x86_64-unknown-freebsd;     NAME=bsd-x86_64;;
+                bsd-aarch64)    T=aarch64-unknown-freebsd;    NAME=bsd-aarch64;;
+                bsd-x86)        T=i686-unknown-freebsd;       NAME=bsd-x86;;
+                android-x86_64) T=x86_64-unknown-linux-musl;  NAME=android-x86_64;;
+                android-aarch64)T=aarch64-unknown-linux-musl; NAME=android-aarch64;;
+                android-x86)    T=i686-unknown-linux-musl;    NAME=android-x86;;
+                android-armv7)  T=armv7-unknown-linux-musleabihf; NAME=android-armv7;;
+                *) echo "skip $s-$a"; continue;;
+              esac
+              cargo build --release --target $T
+              # 找产物
+              SRC="target/$T/release/${{ env.BIN }}"
+              [ -f "$SRC.exe" ] && SRC="$SRC.exe"
+              cp "$SRC" "out/$NAME"
             done
           done
-          echo "matrix=$M" >> "$GITHUB_OUTPUT"
+          ls -la out
 
-  build:
-    needs: gen
-    runs-on: ${{ matrix.sys == 'M' && 'macos-latest' || 'ubuntu-latest' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJson(needs.gen.outputs.matrix) }}
-    name: ${{ matrix.sys }}-${{ matrix.arch }}
+      - name: Upload non-macos artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: non-macos-bins
+          path: out/*
+
+  # ---------- macOS (单独 runner) ----------
+  macos:
+    runs-on: macos-14   # arm64 runner
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Map triple
-        id: t
-        shell: bash
+      - name: Add macOS targets
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: Build macOS (universal-ish, per arch)
         run: |
-          s=${{ matrix.sys }}; a=${{ matrix.arch }}
-          case "$s|$a" in
-            L|x86_64)   T=x86_64-unknown-linux-gnu; E=;;
-            L|aarch64)  T=aarch64-unknown-linux-gnu; E=;;
-            L|armv7)    T=armv7-unknown-linux-gnueabihf; E=;;
-            L|riscv64)  T=riscv64gc-unknown-linux-gnu; E=;;
-            L|loong64)  T=loongarch64-unknown-linux-gnu; E=;;
-            L|mips)     T=mips-unknown-linux-gnu; E=;;
-            L|mipsel)   T=mipsel-unknown-linux-gnu; E=;;
-            W|x86_64)   T=x86_64-pc-windows-gnu; E=.exe;;
-            W|aarch64)  T=aarch64-pc-windows-gnu; E=.exe;;
-            M|x86_64)   T=x86_64-apple-darwin; E=;;
-            M|aarch64)  T=aarch64-apple-darwin; E=;;
-            Android|x86_64) T=x86_64-unknown-linux-musl; E=;;
-            Android|aarch64) T=aarch64-unknown-linux-musl; E=;;
-            Android|armv7)  T=armv7-unknown-linux-musleabihf; E=;;
-          esac
-          echo "triple=$T" >> "$GITHUB_OUTPUT"
-          echo "ext=$E" >> "$GITHUB_OUTPUT"
-          echo "bin=$s-$a$E" >> "$GITHUB_OUTPUT"
+          mkdir -p out
+          ARCH="${{ github.event.inputs.archs }}"
+          [ "$ARCH" = "allarch" ] && ARCH="x86_64 aarch64"
+          # macOS 没有 x86/armv7 实用目标，只处理 x86_64/aarch64
+          for a in $ARCH; do
+            case $a in
+              x86_64)  T=x86_64-apple-darwin;  NAME=macos-x86_64;;
+              aarch64) T=aarch64-apple-darwin; NAME=macos-aarch64;;
+              *) echo "macOS skip $a"; continue;;
+            esac
+            cargo build --release --target $T
+            cp "target/$T/release/${{ env.BIN }}" "out/$NAME"
+          done
+          ls -la out
 
-      - run: rustup target add ${{ steps.t.outputs.triple }}
-
-      - name: Install cross toolchains (non-mac)
-        if: matrix.sys != 'M'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
-            gcc-riscv64-linux-gnu gcc-mips-linux-gnu gcc-mipsel-linux-gnu \
-            gcc-loongarch64-linux-gnu 2>/dev/null || true \
-            gcc-mingw-w64-x86-64 musl-tools
-
-      - name: cargo linker config
-        if: matrix.sys != 'M'
-        shell: bash
-        run: |
-          T=${{ steps.t.outputs.triple }}
-          mkdir -p .cargo
-          case "$T" in
-            aarch64-unknown-linux-gnu) L=aarch64-linux-gnu-gcc;;
-            armv7-unknown-linux-gnueabihf) L=arm-linux-gnueabihf-gcc;;
-            riscv64gc-unknown-linux-gnu) L=riscv64-linux-gnu-gcc;;
-            loongarch64-unknown-linux-gnu) L=loongarch64-linux-gnu-gcc;;
-            mips-unknown-linux-gnu) L=mips-linux-gnu-gcc;;
-            mipsel-unknown-linux-gnu) L=mipsel-linux-gnu-gcc;;
-            x86_64-pc-windows-gnu) L=x86_64-w64-mingw32-gcc;;
-            *musl*) L=musl-gcc;;
-            *) L=gcc;;
-          esac
-          printf '[target.%s]\nlinker = "%s"\n' "$T" "$L" > .cargo/config.toml
-
-      - run: cargo build --release --target ${{ steps.t.outputs.triple }}
-
-      - name: Stage renamed binary
-        shell: bash
-        run: |
-          T=${{ steps.t.outputs.triple }}; BIN=${{ steps.t.outputs.bin }}
-          f=$(ls target/$T/release/ | grep -vE '\.(d|pdb|dwp)$' | grep -E '^[^.]+$' | head -1)
-          mkdir -p out; cp "target/$T/release/$f" "out/$BIN"
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload macos artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: piece-${{ matrix.sys }}-${{ matrix.arch }}
+          name: macos-bins
           path: out/*
 
+  # ---------- 汇总打包 ----------
   bundle:
-    needs: build
+    needs: [non-macos, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
-        with: { path: pieces, pattern: piece-* }
-      - shell: bash
+        with:
+          path: allbins
+      - name: Flatten & zip
         run: |
-          mkdir dist; find pieces -type f -exec cp {} dist/ \;
-          cd dist && (zip -r ../all-builds.zip .)
-      - uses: actions/upload-artifact@v4
-        with: { name: all-builds, path: all-builds.zip }
+          mkdir -p dist
+          find allbins -type f -exec cp {} dist/ \;
+          cd dist
+          ls -la
+          zip -r ../builds-${{ github.run_number }}.zip .
+      - name: Upload final zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-builds
+          path: builds-${{ github.run_number }}.zip
 
