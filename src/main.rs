@@ -521,7 +521,8 @@ fn validate(tasks: &[Task]) -> Result<(), String> {
 fn print_help() {
     println!(
         "{B}mlmake{R} - 常驻 PTY 任务编排器\n\n\
-         用法:\n  mlmake <task> [args...]\n  mlmake list\n  mlmake list all step\n  mlmake help\n",
+         用法:\n  mlmake [--cfg <file.toml>] <task> [args...]\n  mlmake [--cfg <file.toml>] list\n  mlmake [--cfg <file.toml>] list all step\n  mlmake help\n\n\
+         选项:\n  --cfg <file.toml>  指定本次使用的构建文件 (默认: build.toml)\n",
         B = color::BOLD,
         R = color::RESET
     );
@@ -569,11 +570,23 @@ fn cmd_list(b: &BuildFile, args: &[String]) {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let content = match std::fs::read_to_string("build.toml") {
+    let mut args: Vec<String> = std::env::args().collect();
+
+    // ★ 新增：解析前置选项 --cfg <file.toml>
+    let mut cfg_path = String::from("build.toml");
+    if args.len() >= 2 && args[1] == "--cfg" {
+        if args.len() < 3 {
+            eprintln!("{}[错误] --cfg 缺少文件路径{}", color::RED, color::RESET);
+            std::process::exit(1);
+        }
+        cfg_path = args[2].clone();
+        args.drain(1..3); // 去掉 "--cfg" 与其路径，之后逻辑完全复用
+    }
+
+    let content = match std::fs::read_to_string(&cfg_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("{}[错误] 读 build.toml: {}{}", color::RED, e, color::RESET);
+            eprintln!("{}[错误] 读 {}: {}{}", color::RED, cfg_path, e, color::RESET);
             std::process::exit(1);
         }
     };
