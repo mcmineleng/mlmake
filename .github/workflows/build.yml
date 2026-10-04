@@ -1,171 +1,171 @@
-name: Cross Build
+name: 构建编排器工具
 
 on:
   workflow_dispatch:
     inputs:
-      systems:
-        description: 'Target system(s)'
-        type: choice
-        default: linux
-        options: [linux, windows, macos, bsd, android, allsystem]
-      archs:
-        description: 'Target arch(s)'
-        type: choice
-        default: x86_64
-        options: [x86_64, aarch64, armv7, x86, allarch]
-
-env:
-  BIN: myapp   # 改成你的二进制名
+      # macOS
+      macos_aarch64: {type: boolean, default: false, description: "macOS aarch64"}
+      macos_x86_64:  {type: boolean, default: false, description: "macOS x86_64"}
+      # Linux
+      linux_x86_64:  {type: boolean, default: true,  description: "Linux x86_64"}
+      linux_aarch64: {type: boolean, default: false, description: "Linux aarch64"}
+      linux_armv7:   {type: boolean, default: false, description: "Linux armv7"}
+      linux_x86:     {type: boolean, default: false, description: "Linux x86"}
+      # Windows
+      win_x86_64:    {type: boolean, default: false, description: "Windows x86_64"}
+      win_aarch64:   {type: boolean, default: false, description: "Windows aarch64"}
+      win_x86:       {type: boolean, default: false, description: "Windows x86"}
+      # BSD
+      bsd_x86_64:    {type: boolean, default: false, description: "BSD x86_64"}
+      bsd_aarch64:   {type: boolean, default: false, description: "BSD aarch64"}
+      bsd_x86:       {type: boolean, default: false, description: "BSD x86"}
+      # Android (musl 静态)
+      and_x86_64:    {type: boolean, default: false, description: "Android(musl) x86_64"}
+      and_aarch64:   {type: boolean, default: false, description: "Android(musl) aarch64"}
+      and_armv7:     {type: boolean, default: false, description: "Android(musl) armv7"}
+      and_x86:       {type: boolean, default: false, description: "Android(musl) x86"}
 
 jobs:
-  # ---------- Linux / Windows / BSD / Android (Linux runner) ----------
+  # ============ Linux / Win / BSD / Android (ubuntu) ============
   non-macos:
+    if: >-
+      ${{ github.event.inputs.linux_x86_64 == 'true' ||
+          github.event.inputs.linux_aarch64 == 'true' ||
+          github.event.inputs.linux_armv7 == 'true' ||
+          github.event.inputs.linux_x86 == 'true' ||
+          github.event.inputs.win_x86_64 == 'true' ||
+          github.event.inputs.win_aarch64 == 'true' ||
+          github.event.inputs.win_x86 == 'true' ||
+          github.event.inputs.bsd_x86_64 == 'true' ||
+          github.event.inputs.bsd_aarch64 == 'true' ||
+          github.event.inputs.bsd_x86 == 'true' ||
+          github.event.inputs.and_x86_64 == 'true' ||
+          github.event.inputs.and_aarch64 == 'true' ||
+          github.event.inputs.and_armv7 == 'true' ||
+          github.event.inputs.and_x86 == 'true' }}
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf mingw-w64 zig
-          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf \
-                           x86_64-pc-windows-gnu aarch64-pc-windows-gnu i686-pc-windows-gnu \
-                           x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf \
-                           i686-unknown-linux-musl \
-                           x86_64-unknown-freebsd aarch64-unknown-freebsd i686-unknown-freebsd
-
-      - name: Cargo config
-        run: |
-          mkdir -p .cargo
-          cat >> .cargo/config.toml <<'EOF'
-          [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
-          [target.armv7-unknown-linux-gnueabihf]
-          linker = "arm-linux-gnueabihf-gcc"
-          [target.x86_64-pc-windows-gnu]
-          linker = "x86_64-w64-mingw32-gcc"
-          [target.aarch64-pc-windows-gnu]
-          linker = "aarch64-w64-mingw32-gcc"
-          [target.i686-pc-windows-gnu]
-          linker = "i686-w64-mingw32-gcc"
-          [target.x86_64-unknown-linux-musl]
-          linker = "musl-gcc"
-          [target.armv7-unknown-linux-musleabihf]
-          linker = "arm-linux-gnueabihf-gcc"
-          [target.x86_64-unknown-freebsd]
-          linker = "zig"
-          rustflags = ["-C","link-arg=-target","-C","link-arg=x86_64-freebsd"]
-          [target.aarch64-unknown-freebsd]
-          linker = "zig"
-          rustflags = ["-C","link-arg=-target","-C","link-arg=aarch64-freebsd"]
-          [target.i686-unknown-freebsd]
-          linker = "zig"
-          rustflags = ["-C","link-arg=-target","-C","link-arg=i686-freebsd"]
-          EOF
-
-      - name: Build matrix expand
-        id: m
-        run: |
-          SYS="${{ github.event.inputs.systems }}"
-          ARCH="${{ github.event.inputs.archs }}"
-          [ "$SYS" = "allsystem" ] && SYS="linux windows bsd android"
-          [ "$ARCH" = "allarch" ] && ARCH="x86_64 aarch64 armv7 x86"
-          echo "sys=$SYS" >> $GITHUB_OUTPUT
-          echo "arch=$ARCH" >> $GITHUB_OUTPUT
-
-      - name: Build
-        run: |
-          mkdir -p out
-          SYS="${{ steps.m.outputs.sys }}"
-          ARCH="${{ steps.m.outputs.arch }}"
-          for s in $SYS; do
-            for a in $ARCH; do
-              case "$s-$a" in
-                linux-x86_64)   T=x86_64-unknown-linux-gnu;   NAME=linux-x86_64;;
-                linux-aarch64)  T=aarch64-unknown-linux-gnu;  NAME=linux-aarch64;;
-                linux-armv7)    T=armv7-unknown-linux-gnueabihf; NAME=linux-armv7;;
-                linux-x86)      T=i686-unknown-linux-gnu;     NAME=linux-x86;;
-                windows-x86_64) T=x86_64-pc-windows-gnu;      NAME=windows-x86_64.exe;;
-                windows-aarch64)T=aarch64-pc-windows-gnu;     NAME=windows-aarch64.exe;;
-                windows-x86)    T=i686-pc-windows-gnu;        NAME=windows-x86.exe;;
-                bsd-x86_64)     T=x86_64-unknown-freebsd;     NAME=bsd-x86_64;;
-                bsd-aarch64)    T=aarch64-unknown-freebsd;    NAME=bsd-aarch64;;
-                bsd-x86)        T=i686-unknown-freebsd;       NAME=bsd-x86;;
-                android-x86_64) T=x86_64-unknown-linux-musl;  NAME=android-x86_64;;
-                android-aarch64)T=aarch64-unknown-linux-musl; NAME=android-aarch64;;
-                android-x86)    T=i686-unknown-linux-musl;    NAME=android-x86;;
-                android-armv7)  T=armv7-unknown-linux-musleabihf; NAME=android-armv7;;
-                *) echo "skip $s-$a"; continue;;
-              esac
-              cargo build --release --target $T
-              # 找产物
-              SRC="target/$T/release/${{ env.BIN }}"
-              [ -f "$SRC.exe" ] && SRC="$SRC.exe"
-              cp "$SRC" "out/$NAME"
-            done
-          done
-          ls -la out
-
-      - name: Upload non-macos artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: non-macos-bins
-          path: out/*
-
-  # ---------- macOS (单独 runner) ----------
-  macos:
-    runs-on: macos-14   # arm64 runner
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Add macOS targets
-        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+      - name: 扒包名
+        id: pkg
+        run: |
+          BIN=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^name[[:space:]]*=/{v=$0;sub(/^name[[:space:]]*=[[:space:]]*/,"",v);gsub(/[" ]/,"",v);print v;exit}' Cargo.toml)
+          [ -z "$BIN" ] && { echo "::error::未在[package]找到name"; exit 1; }
+          echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+          echo "📦 $BIN"
 
-      - name: Build macOS (universal-ish, per arch)
+      - name: 按需装工具链
+        run: |
+          I='${{ toJSON(github.event.inputs) }}'
+          PK=""; TGT=""
+          jq_has(){ echo "$I" | jq -e ".$1==true" >/dev/null; }
+
+          if jq_has linux_aarch64 || jq_has linux_armv7; then PK="$PK gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf"; fi
+          if jq_has linux_x86; then PK="$PK gcc-i686-linux-gnu"; fi
+          if jq_has win_x86_64 || jq_has win_aarch64 || jq_has win_x86; then PK="$PK mingw-w64"; fi
+          if jq_has bsd_x86_64 || jq_has bsd_aarch64 || jq_has bsd_x86; then PK="$PK zig"; fi
+          if jq_has and_x86_64 || jq_has and_aarch64 || jq_has and_armv7 || jq_has and_x86; then PK="$PK musl-tools gcc-arm-linux-gnueabihf"; fi
+
+          { jq_has linux_aarch64 && echo aarch64-unknown-linux-gnu; } >> /tmp/t
+          { jq_has linux_armv7  && echo armv7-unknown-linux-gnueabihf; } >> /tmp/t
+          { jq_has linux_x86    && echo i686-unknown-linux-gnu; } >> /tmp/t
+          { jq_has win_x86_64   && echo x86_64-pc-windows-gnu; } >> /tmp/t
+          { jq_has win_aarch64  && echo aarch64-pc-windows-gnu; } >> /tmp/t
+          { jq_has win_x86      && echo i686-pc-windows-gnu; } >> /tmp/t
+          { jq_has bsd_x86_64   && echo x86_64-unknown-freebsd; } >> /tmp/t
+          { jq_has bsd_aarch64  && echo aarch64-unknown-freebsd; } >> /tmp/t
+          { jq_has bsd_x86      && echo i686-unknown-freebsd; } >> /tmp/t
+          { jq_has and_x86_64   && echo x86_64-unknown-linux-musl; } >> /tmp/t
+          { jq_has and_aarch64  && echo aarch64-unknown-linux-musl; } >> /tmp/t
+          { jq_has and_armv7    && echo armv7-unknown-linux-musleabihf; } >> /tmp/t
+          { jq_has and_x86      && echo i686-unknown-linux-musl; } >> /tmp/t
+
+          [ -n "$PK" ] && { sudo apt-get update; sudo apt-get install -y $PK; }
+          TGT=$(tr '\n' ' ' < /tmp/t); [ -n "$TGT" ] && rustup target add $TGT
+
+      - name: 写 cargo config（只写用到的）
+        run: |
+          mkdir -p .cargo
+          I='${{ toJSON(github.event.inputs) }}'
+          jq_has(){ echo "$I"|jq -e ".$1==true">/dev/null; }
+          {
+            jq_has linux_aarch64 && echo '[target.aarch64-unknown-linux-gnu]'; jq_has linux_aarch64 && echo 'linker="aarch64-linux-gnu-gcc"'
+            jq_has linux_armv7  && echo '[target.armv7-unknown-linux-gnueabihf]'; jq_has linux_armv7 && echo 'linker="arm-linux-gnueabihf-gcc"'
+            jq_has win_x86_64   && echo '[target.x86_64-pc-windows-gnu]'; jq_has win_x86_64 && echo 'linker="x86_64-w64-mingw32-gcc"'
+            jq_has win_aarch64  && echo '[target.aarch64-pc-windows-gnu]'; jq_has win_aarch64 && echo 'linker="aarch64-w64-mingw32-gcc"'
+            jq_has win_x86      && echo '[target.i686-pc-windows-gnu]'; jq_has win_x86 && echo 'linker="i686-w64-mingw32-gcc"'
+            jq_has and_x86_64   && echo '[target.x86_64-unknown-linux-musl]'; jq_has and_x86_64 && echo 'linker="musl-gcc"'
+            jq_has and_aarch64  && echo '[target.aarch64-unknown-linux-musl]'; jq_has and_aarch64 && echo 'linker="musl-gcc"'
+            jq_has and_armv7    && echo '[target.armv7-unknown-linux-musleabihf]'; jq_has and_armv7 && echo 'linker="arm-linux-gnueabihf-gcc"'
+            jq_has and_x86      && echo '[target.i686-unknown-linux-musl]'; jq_has and_x86 && echo 'linker="musl-gcc"'
+            jq_has bsd_x86_64 && echo '[target.x86_64-unknown-freebsd]'; jq_has bsd_x86_64 && echo 'linker="zig"'; jq_has bsd_x86_64 && echo 'rustflags=["-C","link-arg=-target","-C","link-arg=x86_64-freebsd"]'
+            jq_has bsd_aarch64 && echo '[target.aarch64-unknown-freebsd]'; jq_has bsd_aarch64 && echo 'linker="zig"'; jq_has bsd_aarch64 && echo 'rustflags=["-C","link-arg=-target","-C","link-arg=aarch64-freebsd"]'
+            jq_has bsd_x86 && echo '[target.i686-unknown-freebsd]'; jq_has bsd_x86 && echo 'linker="zig"'; jq_has bsd_x86 && echo 'rustflags=["-C","link-arg=-target","-C","link-arg=i686-freebsd"]'
+          } >> .cargo/config.toml
+          cat .cargo/config.toml
+
+      - name: 构建
         run: |
           mkdir -p out
-          ARCH="${{ github.event.inputs.archs }}"
-          [ "$ARCH" = "allarch" ] && ARCH="x86_64 aarch64"
-          # macOS 没有 x86/armv7 实用目标，只处理 x86_64/aarch64
-          for a in $ARCH; do
-            case $a in
-              x86_64)  T=x86_64-apple-darwin;  NAME=macos-x86_64;;
-              aarch64) T=aarch64-apple-darwin; NAME=macos-aarch64;;
-              *) echo "macOS skip $a"; continue;;
-            esac
-            cargo build --release --target $T
-            cp "target/$T/release/${{ env.BIN }}" "out/$NAME"
-          done
+          BIN="${{ steps.pkg.outputs.bin }}"
+          b(){ local t=$1 n=$2; cargo build --release --target "$t"; local s=target/$t/release/$BIN; [ -f "$s.exe" ]&&s="$s.exe"; cp "$s" "out/$n"; }
+          I='${{ toJSON(github.event.inputs) }}'
+          jq_has(){ echo "$I"|jq -e ".$1==true">/dev/null; }
+          jq_has linux_x86_64  && b x86_64-unknown-linux-gnu linux-x86_64
+          jq_has linux_aarch64 && b aarch64-unknown-linux-gnu linux-aarch64
+          jq_has linux_armv7   && b armv7-unknown-linux-gnueabihf linux-armv7
+          jq_has linux_x86     && b i686-unknown-linux-gnu linux-x86
+          jq_has win_x86_64    && b x86_64-pc-windows-gnu windows-x86_64.exe
+          jq_has win_aarch64   && b aarch64-pc-windows-gnu windows-aarch64.exe
+          jq_has win_x86       && b i686-pc-windows-gnu windows-x86.exe
+          jq_has bsd_x86_64    && b x86_64-unknown-freebsd bsd-x86_64
+          jq_has bsd_aarch64   && b aarch64-unknown-freebsd bsd-aarch64
+          jq_has bsd_x86       && b i686-unknown-freebsd bsd-x86
+          jq_has and_x86_64    && b x86_64-unknown-linux-musl android-x86_64
+          jq_has and_aarch64   && b aarch64-unknown-linux-musl android-aarch64
+          jq_has and_armv7     && b armv7-unknown-linux-musleabihf android-armv7
+          jq_has and_x86       && b i686-unknown-linux-musl android-x86
           ls -la out
 
-      - name: Upload macos artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-bins
-          path: out/*
+      - uses: actions/upload-artifact@v4
+        with: {name: non-macos-bins, path: out/*}
 
-  # ---------- 汇总打包 ----------
+  # ============ macOS 独立 runner ============
+  macos:
+    if: >-
+      ${{ github.event.inputs.macos_aarch64 == 'true' ||
+          github.event.inputs.macos_x86_64 == 'true' }}
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+      - name: 扒包名+构建
+        run: |
+          mkdir -p out
+          BIN=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^name[[:space:]]*=/{v=$0;sub(/^name[[:space:]]*=[[:space:]]*/,"",v);gsub(/[" ]/,"",v);print v;exit}' Cargo.toml)
+          [ -z "$BIN" ] && { echo "::error::未找到[package].name"; exit 1; }
+          echo "📦 $BIN"
+          [ '${{ github.event.inputs.macos_x86_64 }}' = 'true' ] && cargo build --release --target x86_64-apple-darwin && cp target/x86_64-apple-darwin/release/$BIN out/macos-x86_64
+          [ '${{ github.event.inputs.macos_aarch64 }}' = 'true' ] && cargo build --release --target aarch64-apple-darwin && cp target/aarch64-apple-darwin/release/$BIN out/macos-aarch64
+          ls out
+      - uses: actions/upload-artifact@v4
+        with: {name: macos-bins, path: out/*}
+
+  # ============ 汇总 ============
   bundle:
     needs: [non-macos, macos]
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
-        with:
-          path: allbins
-      - name: Flatten & zip
-        run: |
+        with: {path: allbins}
+      - run: |
           mkdir -p dist
           find allbins -type f -exec cp {} dist/ \;
-          cd dist
-          ls -la
-          zip -r ../builds-${{ github.run_number }}.zip .
-      - name: Upload final zip
-        uses: actions/upload-artifact@v4
-        with:
-          name: all-builds
-          path: builds-${{ github.run_number }}.zip
+          cd dist && ls -la && zip -r ../builds.zip .
+      - uses: actions/upload-artifact@v4
+        with: {name: all-builds, path: builds.zip}
 
