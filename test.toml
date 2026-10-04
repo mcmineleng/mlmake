@@ -1,0 +1,158 @@
+# build.toml —— 专门测试 PTY 对 \r (回车) 的处理（慢速版）
+# 用法:
+#   mlmake list
+#   mlmake crtest
+#   mlmake progress
+#   mlmake spin
+#   mlmake callcr
+
+# ========== 1. 基础 \r 覆盖测试 ==========
+[[task]]
+name = "CR 基础测试"
+value = "crtest"
+cmduse = true
+
+  [[task.step]]
+  name = "同一行反复覆盖"
+
+    [[task.step.action]]
+    # 每帧回到行首覆盖：最终只应看到 "Frame 5"
+    run = """
+    for i in 1 2 3 4 5; do
+        printf 'Frame %s' "$i"
+        sleep 1.2
+        printf '\\r'
+    done
+    printf 'Frame 5 done\\n'
+    """
+
+  [[task.step]]
+  name = "百分比进度条"
+
+    [[task.step.action]]
+    run = """
+    i=0
+    while [ $i -le 100 ]; do
+        bar=''
+        n=0
+        while [ $n -lt 20 ]; do
+            if [ $n -lt $((i / 5)) ]; then bar="$bar#"; else bar="$bar-"; fi
+            n=$((n + 1))
+        done
+        printf '[%s] %3d%%' "$bar" "$i"
+        sleep 0.6
+        printf '\\r'
+        i=$((i + 10))
+    done
+    printf '[####################] 100%%\\n'
+    """
+
+  [[task.step]]
+  name = "多行 + 退格混用"
+
+    [[task.step.action]]
+    run = """
+    echo "line 1: normal"
+    echo "line 2: normal"
+    printf 'line 3: counting '
+    for i in 1 2 3; do
+        printf '%s' "$i"
+        sleep 1.2
+        printf '\\b'
+    done
+    printf '3\\n'
+    """
+
+# ========== 2. 模拟 cargo 风格（soft-wrap 测试） ==========
+[[task]]
+name = "Cargo 风格进度"
+value = "progress"
+cmduse = true
+
+  [[task.step]]
+  name = "长行 + \r 覆盖（若 PTY 宽度不对会显示多行）"
+
+    [[task.step.action]]
+    # 故意写一行很长的内容，然后 \r 覆盖。
+    # 若 PTY 宽度 == 终端宽度，\r 应回到同一物理行行首，
+    # 视觉上只看到一行不断变化；否则会堆很多行。
+    run = """
+    i=0
+    while [ $i -lt 5 ]; do
+        printf 'Building [==========] %d/5  crate_name_with_a_rather_long_name  target/release/deps/some_big_crate' "$i"
+        sleep 1.5
+        printf '\\r'
+        i=$((i + 1))
+    done
+    printf 'Building [==========] 5/5  crate_name_with_a_rather_long_name  target/release/deps/some_big_crate\\n'
+    """
+
+  [[task.step]]
+  name = "多段 cargo 样式（模拟依赖编译）"
+
+    [[task.step.action]]
+    run = """
+    for crate in serde tokio clap toml; do
+        i=0
+        while [ $i -le 10 ]; do
+            printf '   Compiling %s v0.1.%d' "$crate" "$i"
+            sleep 0.25
+            printf '\\r'
+            i=$((i + 1))
+        done
+        printf '   Compiling %s v0.1.10\\n' "$crate"
+        sleep 0.8
+    done
+    echo "    Finished release [optimized] target(s)"
+    """
+
+# ========== 3. 极端情况：spinner + 覆盖 ==========
+[[task]]
+name = "Spinner 旋转"
+value = "spin"
+cmduse = true
+
+  [[task.step]]
+  name = "ASCII spinner"
+
+    [[task.step.action]]
+    run = """
+    n=0
+    while [ $n -lt 20 ]; do
+        case $((n % 4)) in
+            0) c='|' ;;
+            1) c='/' ;;
+            2) c='-' ;;
+            3) c='\\\\' ;;
+        esac
+        printf '%s working...' "$c"
+        sleep 0.5
+        printf '\\r'
+        n=$((n + 1))
+    done
+    printf 'done\\n'
+    """
+
+# ========== 4. 结合内部 task 调用 ==========
+[[task]]
+name = "调用 CR 测试"
+value = "callcr"
+cmduse = true
+
+  [[task.step]]
+  name = "先跑一段普通命令"
+
+    [[task.step.action]]
+    run = "echo 'before nested task'"
+
+  [[task.step]]
+  name = "嵌套调用 crtest"
+
+    [[task.step.action]]
+    builtin = ["task crtest"]
+
+  [[task.step]]
+  name = "结束"
+
+    [[task.step.action]]
+    run = "echo 'after nested task'"

@@ -1,0 +1,147 @@
+name: 编译
+
+on:
+  workflow_dispatch:
+    inputs:
+      system:
+        type: choice
+        options: [L, W, M, Android, all-system]
+        default: L
+      arch:
+        type: choice
+        options: [x86_64, aarch64, armv7, riscv64, loong64, mips, mipsel, all-arch]
+        default: x86_64
+
+jobs:
+  gen:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.g.outputs.matrix }}
+    steps:
+      - id: g
+        shell: bash
+        run: |
+          SYS="${{ inputs.system }}"; ARCH="${{ inputs.arch }}"
+          # 各平台允许的架构
+          L_ARCH=(x86_64 aarch64 armv7 riscv64 loong64 mips mipsel)
+          W_ARCH=(x86_64 aarch64)
+          M_ARCH=(x86_64 aarch64)
+          A_ARCH=(x86_64 aarch64 armv7)
+
+          case "$SYS" in
+            all-system) SYS_ARR=(L W M Android);;
+            *) SYS_ARR=($SYS);;
+          esac
+
+          M="[]"
+          for s in "${SYS_ARR[@]}"; do
+            case $s in
+              L) ARRS=("${L_ARCH[@]}");;
+              W) ARRS=("${W_ARCH[@]}");;
+              M) ARRS=("${M_ARCH[@]}");;
+              Android) ARRS=("${A_ARCH[@]}");;
+            esac
+            if [ "$ARCH" = "all-arch" ]; then PICK=("${ARRS[@]}"); else PICK=("$ARCH"); fi
+            # 过滤非法组合
+            for a in "${PICK[@]}"; do
+              ok=0; for x in "${ARRS[@]}"; do [ "$x" = "$a" ] && ok=1; done
+              [ $ok -eq 1 ] && M=$(echo "$M" | jq ".+[{\"sys\":\"$s\",\"arch\":\"$a\"}]")
+            done
+          done
+          echo "matrix=$M" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: gen
+    runs-on: ${{ matrix.sys == 'M' && 'macos-latest' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.gen.outputs.matrix) }}
+    name: ${{ matrix.sys }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Map triple
+        id: t
+        shell: bash
+        run: |
+          s=${{ matrix.sys }}; a=${{ matrix.arch }}
+          case "$s|$a" in
+            L|x86_64)   T=x86_64-unknown-linux-gnu; E=;;
+            L|aarch64)  T=aarch64-unknown-linux-gnu; E=;;
+            L|armv7)    T=armv7-unknown-linux-gnueabihf; E=;;
+            L|riscv64)  T=riscv64gc-unknown-linux-gnu; E=;;
+            L|loong64)  T=loongarch64-unknown-linux-gnu; E=;;
+            L|mips)     T=mips-unknown-linux-gnu; E=;;
+            L|mipsel)   T=mipsel-unknown-linux-gnu; E=;;
+            W|x86_64)   T=x86_64-pc-windows-gnu; E=.exe;;
+            W|aarch64)  T=aarch64-pc-windows-gnu; E=.exe;;
+            M|x86_64)   T=x86_64-apple-darwin; E=;;
+            M|aarch64)  T=aarch64-apple-darwin; E=;;
+            Android|x86_64) T=x86_64-unknown-linux-musl; E=;;
+            Android|aarch64) T=aarch64-unknown-linux-musl; E=;;
+            Android|armv7)  T=armv7-unknown-linux-musleabihf; E=;;
+          esac
+          echo "triple=$T" >> "$GITHUB_OUTPUT"
+          echo "ext=$E" >> "$GITHUB_OUTPUT"
+          echo "bin=$s-$a$E" >> "$GITHUB_OUTPUT"
+
+      - run: rustup target add ${{ steps.t.outputs.triple }}
+
+      - name: Install cross toolchains (non-mac)
+        if: matrix.sys != 'M'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
+            gcc-riscv64-linux-gnu gcc-mips-linux-gnu gcc-mipsel-linux-gnu \
+            gcc-loongarch64-linux-gnu 2>/dev/null || true \
+            gcc-mingw-w64-x86-64 musl-tools
+
+      - name: cargo linker config
+        if: matrix.sys != 'M'
+        shell: bash
+        run: |
+          T=${{ steps.t.outputs.triple }}
+          mkdir -p .cargo
+          case "$T" in
+            aarch64-unknown-linux-gnu) L=aarch64-linux-gnu-gcc;;
+            armv7-unknown-linux-gnueabihf) L=arm-linux-gnueabihf-gcc;;
+            riscv64gc-unknown-linux-gnu) L=riscv64-linux-gnu-gcc;;
+            loongarch64-unknown-linux-gnu) L=loongarch64-linux-gnu-gcc;;
+            mips-unknown-linux-gnu) L=mips-linux-gnu-gcc;;
+            mipsel-unknown-linux-gnu) L=mipsel-linux-gnu-gcc;;
+            x86_64-pc-windows-gnu) L=x86_64-w64-mingw32-gcc;;
+            *musl*) L=musl-gcc;;
+            *) L=gcc;;
+          esac
+          printf '[target.%s]\nlinker = "%s"\n' "$T" "$L" > .cargo/config.toml
+
+      - run: cargo build --release --target ${{ steps.t.outputs.triple }}
+
+      - name: Stage renamed binary
+        shell: bash
+        run: |
+          T=${{ steps.t.outputs.triple }}; BIN=${{ steps.t.outputs.bin }}
+          f=$(ls target/$T/release/ | grep -vE '\.(d|pdb|dwp)$' | grep -E '^[^.]+$' | head -1)
+          mkdir -p out; cp "target/$T/release/$f" "out/$BIN"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: piece-${{ matrix.sys }}-${{ matrix.arch }}
+          path: out/*
+
+  bundle:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: pieces, pattern: piece-* }
+      - shell: bash
+        run: |
+          mkdir dist; find pieces -type f -exec cp {} dist/ \;
+          cd dist && (zip -r ../all-builds.zip .)
+      - uses: actions/upload-artifact@v4
+        with: { name: all-builds, path: all-builds.zip }
+
