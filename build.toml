@@ -1,0 +1,83 @@
+# ============================================================
+# mlmake build.toml
+# ============================================================
+
+# ------------------------------------------------------------
+# clean - 清理产物
+# ------------------------------------------------------------
+[[task]]
+name = '清理'
+value = 'clean'
+cmduse = true
+
+[[task.step]]
+name = '清理 cargo 缓存'
+[[task.step.action]]
+run = '''
+cargo clean
+'''
+
+[[task.step]]
+name = '删除 release 目录'
+[[task.step.action]]
+run = '''
+rm -rf target/release
+'''
+
+# ------------------------------------------------------------
+# debug - 构建 debug 版本（不清理）
+# ------------------------------------------------------------
+[[task]]
+name = '调试构建'
+value = 'debug'
+cmduse = true
+
+[[task.step]]
+name = '编译 debug'
+[[task.step.action]]
+run = '''
+cargo build
+'''
+
+# ------------------------------------------------------------
+# release - 构建 release 版本（先清理）
+# ------------------------------------------------------------
+[[task]]
+name = '发布构建'
+value = 'release'
+cmduse = true
+
+[[task.step]]
+name = '清理'
+require_success = true
+[[task.step.action]]
+builtin = ['task clean']
+
+[[task.step]]
+name = '编译 release'
+require_success = true
+[[task.step.action]]
+run = '''
+cargo build --release
+'''
+
+# ------------------------------------------------------------
+# build - 同时构建 debug 和 release
+# ------------------------------------------------------------
+[[task]]
+name = '完整构建'
+value = 'build'
+cmduse = true
+
+[[task.step]]
+name = '调试构建'
+require_success = true
+[[task.step.action]]
+builtin = ['task debug']
+
+[[task.step]]
+name = '发布构建'
+require_success = true
+[[task.step.action]]
+builtin = ['task release']
+

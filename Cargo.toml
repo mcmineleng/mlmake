@@ -1,0 +1,14 @@
+[package]
+name = "mlmake"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "mlmake"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+portable-pty = "0.8"
+libc = "0.2.190"
