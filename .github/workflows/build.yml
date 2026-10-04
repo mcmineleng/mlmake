@@ -1,171 +1,186 @@
-name: 构建编排器工具
+name: Cross Build (checkboxes)
 
 on:
   workflow_dispatch:
     inputs:
-      # macOS
       macos_aarch64: {type: boolean, default: false, description: "macOS aarch64"}
       macos_x86_64:  {type: boolean, default: false, description: "macOS x86_64"}
-      # Linux
+
       linux_x86_64:  {type: boolean, default: true,  description: "Linux x86_64"}
       linux_aarch64: {type: boolean, default: false, description: "Linux aarch64"}
       linux_armv7:   {type: boolean, default: false, description: "Linux armv7"}
       linux_x86:     {type: boolean, default: false, description: "Linux x86"}
-      # Windows
+
       win_x86_64:    {type: boolean, default: false, description: "Windows x86_64"}
       win_aarch64:   {type: boolean, default: false, description: "Windows aarch64"}
       win_x86:       {type: boolean, default: false, description: "Windows x86"}
-      # BSD
+
       bsd_x86_64:    {type: boolean, default: false, description: "BSD x86_64"}
       bsd_aarch64:   {type: boolean, default: false, description: "BSD aarch64"}
       bsd_x86:       {type: boolean, default: false, description: "BSD x86"}
-      # Android (musl 静态)
+
       and_x86_64:    {type: boolean, default: false, description: "Android(musl) x86_64"}
       and_aarch64:   {type: boolean, default: false, description: "Android(musl) aarch64"}
       and_armv7:     {type: boolean, default: false, description: "Android(musl) armv7"}
       and_x86:       {type: boolean, default: false, description: "Android(musl) x86"}
 
 jobs:
-  # ============ Linux / Win / BSD / Android (ubuntu) ============
+  # ===================== non-macos =====================
   non-macos:
     if: >-
-      ${{ github.event.inputs.linux_x86_64 == 'true' ||
-          github.event.inputs.linux_aarch64 == 'true' ||
-          github.event.inputs.linux_armv7 == 'true' ||
-          github.event.inputs.linux_x86 == 'true' ||
-          github.event.inputs.win_x86_64 == 'true' ||
-          github.event.inputs.win_aarch64 == 'true' ||
-          github.event.inputs.win_x86 == 'true' ||
-          github.event.inputs.bsd_x86_64 == 'true' ||
-          github.event.inputs.bsd_aarch64 == 'true' ||
-          github.event.inputs.bsd_x86 == 'true' ||
-          github.event.inputs.and_x86_64 == 'true' ||
-          github.event.inputs.and_aarch64 == 'true' ||
-          github.event.inputs.and_armv7 == 'true' ||
-          github.event.inputs.and_x86 == 'true' }}
+      ${{ inputs.linux_x86_64 || inputs.linux_aarch64 || inputs.linux_armv7 || inputs.linux_x86 ||
+          inputs.win_x86_64 || inputs.win_aarch64 || inputs.win_x86 ||
+          inputs.bsd_x86_64 || inputs.bsd_aarch64 || inputs.bsd_x86 ||
+          inputs.and_x86_64 || inputs.and_aarch64 || inputs.and_armv7 || inputs.and_x86 }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: 扒包名
+      - name: 读包名
         id: pkg
         run: |
-          BIN=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^name[[:space:]]*=/{v=$0;sub(/^name[[:space:]]*=[[:space:]]*/,"",v);gsub(/[" ]/,"",v);print v;exit}' Cargo.toml)
-          [ -z "$BIN" ] && { echo "::error::未在[package]找到name"; exit 1; }
+          BIN=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^name[[:space:]]*=/{v=$0;sub(/^name[[:space:]]*=[[:space:]]*/,"",v);gsub(/[" \r]/,"",v);print v;exit}' Cargo.toml)
+          [ -z "$BIN" ] && { echo "::error::Cargo.toml 里没找到 [package].name"; exit 1; }
           echo "bin=$BIN" >> "$GITHUB_OUTPUT"
-          echo "📦 $BIN"
+          echo "BIN=$BIN"
 
-      - name: 按需装工具链
+      - name: 按需装工具链 + 加 target
         run: |
-          I='${{ toJSON(github.event.inputs) }}'
+          set -euo pipefail
+          I='${{ toJSON(inputs) }}'
+          has(){ jq -r "if .$1 == true then \"1\" else \"0\" end" <<<"$I"; }
+
           PK=""; TGT=""
-          jq_has(){ echo "$I" | jq -e ".$1==true" >/dev/null; }
+          rm -f /tmp/tgt.txt
 
-          if jq_has linux_aarch64 || jq_has linux_armv7; then PK="$PK gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf"; fi
-          if jq_has linux_x86; then PK="$PK gcc-i686-linux-gnu"; fi
-          if jq_has win_x86_64 || jq_has win_aarch64 || jq_has win_x86; then PK="$PK mingw-w64"; fi
-          if jq_has bsd_x86_64 || jq_has bsd_aarch64 || jq_has bsd_x86; then PK="$PK zig"; fi
-          if jq_has and_x86_64 || jq_has and_aarch64 || jq_has and_armv7 || jq_has and_x86; then PK="$PK musl-tools gcc-arm-linux-gnueabihf"; fi
+          if [ "$(has linux_aarch64)" = 1 ] || [ "$(has linux_armv7)" = 1 ]; then PK="$PK gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf"; fi
+          if [ "$(has linux_x86)" = 1 ]; then PK="$PK gcc-i686-linux-gnu"; fi
+          if [ "$(has win_x86_64)" = 1 ] || [ "$(has win_aarch64)" = 1 ] || [ "$(has win_x86)" = 1 ]; then PK="$PK mingw-w64"; fi
+          if [ "$(has bsd_x86_64)" = 1 ] || [ "$(has bsd_aarch64)" = 1 ] || [ "$(has bsd_x86)" = 1 ]; then PK="$PK zig"; fi
+          if [ "$(has and_x86_64)" = 1 ] || [ "$(has and_aarch64)" = 1 ] || [ "$(has and_armv7)" = 1 ] || [ "$(has and_x86)" = 1 ]; then PK="$PK musl-tools gcc-arm-linux-gnueabihf"; fi
 
-          { jq_has linux_aarch64 && echo aarch64-unknown-linux-gnu; } >> /tmp/t
-          { jq_has linux_armv7  && echo armv7-unknown-linux-gnueabihf; } >> /tmp/t
-          { jq_has linux_x86    && echo i686-unknown-linux-gnu; } >> /tmp/t
-          { jq_has win_x86_64   && echo x86_64-pc-windows-gnu; } >> /tmp/t
-          { jq_has win_aarch64  && echo aarch64-pc-windows-gnu; } >> /tmp/t
-          { jq_has win_x86      && echo i686-pc-windows-gnu; } >> /tmp/t
-          { jq_has bsd_x86_64   && echo x86_64-unknown-freebsd; } >> /tmp/t
-          { jq_has bsd_aarch64  && echo aarch64-unknown-freebsd; } >> /tmp/t
-          { jq_has bsd_x86      && echo i686-unknown-freebsd; } >> /tmp/t
-          { jq_has and_x86_64   && echo x86_64-unknown-linux-musl; } >> /tmp/t
-          { jq_has and_aarch64  && echo aarch64-unknown-linux-musl; } >> /tmp/t
-          { jq_has and_armv7    && echo armv7-unknown-linux-musleabihf; } >> /tmp/t
-          { jq_has and_x86      && echo i686-unknown-linux-musl; } >> /tmp/t
+          [ "$(has linux_aarch64)" = 1 ] && echo aarch64-unknown-linux-gnu >> /tmp/tgt.txt
+          [ "$(has linux_armv7)"  = 1 ] && echo armv7-unknown-linux-gnueabihf >> /tmp/tgt.txt
+          [ "$(has linux_x86)"    = 1 ] && echo i686-unknown-linux-gnu >> /tmp/tgt.txt
+          [ "$(has win_x86_64)"   = 1 ] && echo x86_64-pc-windows-gnu >> /tmp/tgt.txt
+          [ "$(has win_aarch64)"  = 1 ] && echo aarch64-pc-windows-gnu >> /tmp/tgt.txt
+          [ "$(has win_x86)"      = 1 ] && echo i686-pc-windows-gnu >> /tmp/tgt.txt
+          [ "$(has bsd_x86_64)"   = 1 ] && echo x86_64-unknown-freebsd >> /tmp/tgt.txt
+          [ "$(has bsd_aarch64)"  = 1 ] && echo aarch64-unknown-freebsd >> /tmp/tgt.txt
+          [ "$(has bsd_x86)"      = 1 ] && echo i686-unknown-freebsd >> /tmp/tgt.txt
+          [ "$(has and_x86_64)"   = 1 ] && echo x86_64-unknown-linux-musl >> /tmp/tgt.txt
+          [ "$(has and_aarch64)"  = 1 ] && echo aarch64-unknown-linux-musl >> /tmp/tgt.txt
+          [ "$(has and_armv7)"    = 1 ] && echo armv7-unknown-linux-musleabihf >> /tmp/tgt.txt
+          [ "$(has and_x86)"      = 1 ] && echo i686-unknown-linux-musl >> /tmp/tgt.txt
 
-          [ -n "$PK" ] && { sudo apt-get update; sudo apt-get install -y $PK; }
-          TGT=$(tr '\n' ' ' < /tmp/t); [ -n "$TGT" ] && rustup target add $TGT
+          if [ -n "$PK" ]; then
+            sudo apt-get update
+            sudo apt-get install -y $PK
+          fi
+          if [ -s /tmp/tgt.txt ]; then
+            rustup target add $(tr '\n' ' ' < /tmp/tgt.txt)
+          fi
 
-      - name: 写 cargo config（只写用到的）
+      - name: 写 .cargo/config.toml（只写用到的）
         run: |
+          set -euo pipefail
+          I='${{ toJSON(inputs) }}'
+          has(){ jq -r "if .$1 == true then \"1\" else \"0\" end" <<<"$I"; }
           mkdir -p .cargo
-          I='${{ toJSON(github.event.inputs) }}'
-          jq_has(){ echo "$I"|jq -e ".$1==true">/dev/null; }
           {
-            jq_has linux_aarch64 && echo '[target.aarch64-unknown-linux-gnu]'; jq_has linux_aarch64 && echo 'linker="aarch64-linux-gnu-gcc"'
-            jq_has linux_armv7  && echo '[target.armv7-unknown-linux-gnueabihf]'; jq_has linux_armv7 && echo 'linker="arm-linux-gnueabihf-gcc"'
-            jq_has win_x86_64   && echo '[target.x86_64-pc-windows-gnu]'; jq_has win_x86_64 && echo 'linker="x86_64-w64-mingw32-gcc"'
-            jq_has win_aarch64  && echo '[target.aarch64-pc-windows-gnu]'; jq_has win_aarch64 && echo 'linker="aarch64-w64-mingw32-gcc"'
-            jq_has win_x86      && echo '[target.i686-pc-windows-gnu]'; jq_has win_x86 && echo 'linker="i686-w64-mingw32-gcc"'
-            jq_has and_x86_64   && echo '[target.x86_64-unknown-linux-musl]'; jq_has and_x86_64 && echo 'linker="musl-gcc"'
-            jq_has and_aarch64  && echo '[target.aarch64-unknown-linux-musl]'; jq_has and_aarch64 && echo 'linker="musl-gcc"'
-            jq_has and_armv7    && echo '[target.armv7-unknown-linux-musleabihf]'; jq_has and_armv7 && echo 'linker="arm-linux-gnueabihf-gcc"'
-            jq_has and_x86      && echo '[target.i686-unknown-linux-musl]'; jq_has and_x86 && echo 'linker="musl-gcc"'
-            jq_has bsd_x86_64 && echo '[target.x86_64-unknown-freebsd]'; jq_has bsd_x86_64 && echo 'linker="zig"'; jq_has bsd_x86_64 && echo 'rustflags=["-C","link-arg=-target","-C","link-arg=x86_64-freebsd"]'
-            jq_has bsd_aarch64 && echo '[target.aarch64-unknown-freebsd]'; jq_has bsd_aarch64 && echo 'linker="zig"'; jq_has bsd_aarch64 && echo 'rustflags=["-C","link-arg=-target","-C","link-arg=aarch64-freebsd"]'
-            jq_has bsd_x86 && echo '[target.i686-unknown-freebsd]'; jq_has bsd_x86 && echo 'linker="zig"'; jq_has bsd_x86 && echo 'rustflags=["-C","link-arg=-target","-C","link-arg=i686-freebsd"]'
+            [ "$(has linux_aarch64)" = 1 ] && { echo '[target.aarch64-unknown-linux-gnu]'; echo 'linker = "aarch64-linux-gnu-gcc"'; }
+            [ "$(has linux_armv7)"  = 1 ] && { echo '[target.armv7-unknown-linux-gnueabihf]'; echo 'linker = "arm-linux-gnueabihf-gcc"'; }
+            [ "$(has win_x86_64)"   = 1 ] && { echo '[target.x86_64-pc-windows-gnu]'; echo 'linker = "x86_64-w64-mingw32-gcc"'; }
+            [ "$(has win_aarch64)"  = 1 ] && { echo '[target.aarch64-pc-windows-gnu]'; echo 'linker = "aarch64-w64-mingw32-gcc"'; }
+            [ "$(has win_x86)"      = 1 ] && { echo '[target.i686-pc-windows-gnu]'; echo 'linker = "i686-w64-mingw32-gcc"'; }
+            [ "$(has and_x86_64)"   = 1 ] && { echo '[target.x86_64-unknown-linux-musl]'; echo 'linker = "musl-gcc"'; }
+            [ "$(has and_aarch64)"  = 1 ] && { echo '[target.aarch64-unknown-linux-musl]'; echo 'linker = "musl-gcc"'; }
+            [ "$(has and_x86)"      = 1 ] && { echo '[target.i686-unknown-linux-musl]'; echo 'linker = "musl-gcc"'; }
+            [ "$(has and_armv7)"    = 1 ] && { echo '[target.armv7-unknown-linux-musleabihf]'; echo 'linker = "arm-linux-gnueabihf-gcc"'; }
+            [ "$(has bsd_x86_64)"   = 1 ] && { echo '[target.x86_64-unknown-freebsd]'; echo 'linker = "zig"'; echo 'rustflags = ["-C", "link-arg=-target", "-C", "link-arg=x86_64-freebsd"]'; }
+            [ "$(has bsd_aarch64)"  = 1 ] && { echo '[target.aarch64-unknown-freebsd]'; echo 'linker = "zig"'; echo 'rustflags = ["-C", "link-arg=-target", "-C", "link-arg=aarch64-freebsd"]'; }
+            [ "$(has bsd_x86)"      = 1 ] && { echo '[target.i686-unknown-freebsd]'; echo 'linker = "zig"'; echo 'rustflags = ["-C", "link-arg=-target", "-C", "link-arg=i686-freebsd"]'; }
           } >> .cargo/config.toml
+          echo "----- .cargo/config.toml -----"
           cat .cargo/config.toml
 
       - name: 构建
         run: |
-          mkdir -p out
+          set -euo pipefail
+          I='${{ toJSON(inputs) }}'
+          has(){ jq -r "if .$1 == true then \"1\" else \"0\" end" <<<"$I"; }
           BIN="${{ steps.pkg.outputs.bin }}"
-          b(){ local t=$1 n=$2; cargo build --release --target "$t"; local s=target/$t/release/$BIN; [ -f "$s.exe" ]&&s="$s.exe"; cp "$s" "out/$n"; }
-          I='${{ toJSON(github.event.inputs) }}'
-          jq_has(){ echo "$I"|jq -e ".$1==true">/dev/null; }
-          jq_has linux_x86_64  && b x86_64-unknown-linux-gnu linux-x86_64
-          jq_has linux_aarch64 && b aarch64-unknown-linux-gnu linux-aarch64
-          jq_has linux_armv7   && b armv7-unknown-linux-gnueabihf linux-armv7
-          jq_has linux_x86     && b i686-unknown-linux-gnu linux-x86
-          jq_has win_x86_64    && b x86_64-pc-windows-gnu windows-x86_64.exe
-          jq_has win_aarch64   && b aarch64-pc-windows-gnu windows-aarch64.exe
-          jq_has win_x86       && b i686-pc-windows-gnu windows-x86.exe
-          jq_has bsd_x86_64    && b x86_64-unknown-freebsd bsd-x86_64
-          jq_has bsd_aarch64   && b aarch64-unknown-freebsd bsd-aarch64
-          jq_has bsd_x86       && b i686-unknown-freebsd bsd-x86
-          jq_has and_x86_64    && b x86_64-unknown-linux-musl android-x86_64
-          jq_has and_aarch64   && b aarch64-unknown-linux-musl android-aarch64
-          jq_has and_armv7     && b armv7-unknown-linux-musleabihf android-armv7
-          jq_has and_x86       && b i686-unknown-linux-musl android-x86
+          mkdir -p out
+          b(){ local t=$1 n=$2; cargo build --release --target "$t"; local s="target/$t/release/$BIN"; [ -f "$s.exe" ] && s="$s.exe"; cp "$s" "out/$n"; }
+
+          [ "$(has linux_x86_64)"  = 1 ] && b x86_64-unknown-linux-gnu linux-x86_64
+          [ "$(has linux_aarch64)" = 1 ] && b aarch64-unknown-linux-gnu linux-aarch64
+          [ "$(has linux_armv7)"   = 1 ] && b armv7-unknown-linux-gnueabihf linux-armv7
+          [ "$(has linux_x86)"     = 1 ] && b i686-unknown-linux-gnu linux-x86
+
+          [ "$(has win_x86_64)"    = 1 ] && b x86_64-pc-windows-gnu windows-x86_64.exe
+          [ "$(has win_aarch64)"   = 1 ] && b aarch64-pc-windows-gnu windows-aarch64.exe
+          [ "$(has win_x86)"       = 1 ] && b i686-pc-windows-gnu windows-x86.exe
+
+          [ "$(has bsd_x86_64)"    = 1 ] && b x86_64-unknown-freebsd bsd-x86_64
+          [ "$(has bsd_aarch64)"   = 1 ] && b aarch64-unknown-freebsd bsd-aarch64
+          [ "$(has bsd_x86)"       = 1 ] && b i686-unknown-freebsd bsd-x86
+
+          [ "$(has and_x86_64)"    = 1 ] && b x86_64-unknown-linux-musl android-x86_64
+          [ "$(has and_aarch64)"   = 1 ] && b aarch64-unknown-linux-musl android-aarch64
+          [ "$(has and_armv7)"     = 1 ] && b armv7-unknown-linux-musleabihf android-armv7
+          [ "$(has and_x86)"       = 1 ] && b i686-unknown-linux-musl android-x86
+
           ls -la out
 
       - uses: actions/upload-artifact@v4
-        with: {name: non-macos-bins, path: out/*}
+        with:
+          name: non-macos-bins
+          path: out/*
 
-  # ============ macOS 独立 runner ============
+  # ===================== macos =====================
   macos:
-    if: >-
-      ${{ github.event.inputs.macos_aarch64 == 'true' ||
-          github.event.inputs.macos_x86_64 == 'true' }}
+    if: ${{ inputs.macos_aarch64 || inputs.macos_x86_64 }}
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
-      - name: 扒包名+构建
+      - name: 构建
         run: |
+          set -euo pipefail
+          BIN=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^name[[:space:]]*=/{v=$0;sub(/^name[[:space:]]*=[[:space:]]*/,"",v);gsub(/[" \r]/,"",v);print v;exit}' Cargo.toml)
+          [ -z "$BIN" ] && { echo "::error::Cargo.toml 里没找到 [package].name"; exit 1; }
+          echo "BIN=$BIN"
           mkdir -p out
-          BIN=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^name[[:space:]]*=/{v=$0;sub(/^name[[:space:]]*=[[:space:]]*/,"",v);gsub(/[" ]/,"",v);print v;exit}' Cargo.toml)
-          [ -z "$BIN" ] && { echo "::error::未找到[package].name"; exit 1; }
-          echo "📦 $BIN"
-          [ '${{ github.event.inputs.macos_x86_64 }}' = 'true' ] && cargo build --release --target x86_64-apple-darwin && cp target/x86_64-apple-darwin/release/$BIN out/macos-x86_64
-          [ '${{ github.event.inputs.macos_aarch64 }}' = 'true' ] && cargo build --release --target aarch64-apple-darwin && cp target/aarch64-apple-darwin/release/$BIN out/macos-aarch64
-          ls out
+          [ "${{ inputs.macos_x86_64 }}" = "true" ] && cargo build --release --target x86_64-apple-darwin && cp "target/x86_64-apple-darwin/release/$BIN" out/macos-x86_64
+          [ "${{ inputs.macos_aarch64 }}" = "true" ] && cargo build --release --target aarch64-apple-darwin && cp "target/aarch64-apple-darwin/release/$BIN" out/macos-aarch64
+          ls -la out
       - uses: actions/upload-artifact@v4
-        with: {name: macos-bins, path: out/*}
+        with:
+          name: macos-bins
+          path: out/*
 
-  # ============ 汇总 ============
+  # ===================== bundle =====================
   bundle:
     needs: [non-macos, macos]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
-        with: {path: allbins}
-      - run: |
+        with:
+          path: allbins
+      - name: 汇总打包
+        run: |
+          set -euo pipefail
           mkdir -p dist
           find allbins -type f -exec cp {} dist/ \;
-          cd dist && ls -la && zip -r ../builds.zip .
+          cd dist
+          ls -la
+          zip -r ../builds.zip .
       - uses: actions/upload-artifact@v4
-        with: {name: all-builds, path: builds.zip}
+        with:
+          name: all-builds
+          path: builds.zip
 
