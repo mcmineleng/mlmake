@@ -11,17 +11,18 @@ on:
       linux_armv7:   {type: boolean, default: false, description: "Linux armv7"}
       linux_x86:     {type: boolean, default: false, description: "Linux x86"}
 
-      win_x86_64:    {type: boolean, default: false, description: "Windows x86_64 (MSVC)"}
-      win_x86:       {type: boolean, default: false, description: "Windows x86 (MSVC)"}
-
       bsd_x86_64:    {type: boolean, default: false, description: "BSD x86_64"}
       bsd_aarch64:   {type: boolean, default: false, description: "BSD aarch64"}
       bsd_x86:       {type: boolean, default: false, description: "BSD x86"}
 
-      and_x86_64:    {type: boolean, default: false, description: "Android(musl) x86_64"}
-      and_aarch64:   {type: boolean, default: false, description: "Android(musl) aarch64"}
-      and_armv7:     {type: boolean, default: false, description: "Android(musl) armv7"}
-      and_x86:       {type: boolean, default: false, description: "Android(musl) x86"}
+      and_x86_64:    {type: boolean, default: false, description: "Android x86_64"}
+      and_aarch64:   {type: boolean, default: false, description: "Android aarch64"}
+      and_armv7:     {type: boolean, default: false, description: "Android armv7"}
+      and_x86:       {type: boolean, default: false, description: "Android x86"}
+
+env:
+  ANDROID_NDK_VERSION: r27c
+  CARGO_TERM_COLOR: always
 
 defaults:
   run:
@@ -45,6 +46,17 @@ jobs:
         with:
           version: 0.13.0
 
+      - name: 安装 NDK（Android 用）
+        if: ${{ inputs.and_x86_64 || inputs.and_aarch64 || inputs.and_armv7 || inputs.and_x86 }}
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.ANDROID_NDK_VERSION }}
+
+      - name: 安装 cargo-ndk
+        if: ${{ inputs.and_x86_64 || inputs.and_aarch64 || inputs.and_armv7 || inputs.and_x86 }}
+        run: cargo install cargo-ndk --version 3.5.5 --locked
+
       - name: 读包名
         id: pkg
         run: |
@@ -52,32 +64,33 @@ jobs:
           [ -z "$BIN" ] && { echo "::error::Cargo.toml 未找到 [package].name"; exit 1; }
           echo "bin=$BIN" >> "$GITHUB_OUTPUT"
 
-      - name: 按需装工具链
+      - name: 按需装工具链（仅 Linux/BSD，已去 musl）
         run: |
           set -euo pipefail
           I='${{ toJSON(inputs) }}'
           has(){ jq -r "if .$1 == true then \"1\" else \"0\" end" <<<"$I"; }
-          PK=""; rm -f /tmp/tgt.txt
+          PK=""
+          [ "$(has linux_aarch64)" = 1 ] || [ "$(has linux_armv7)" = 1 ] && PK="$PK gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf"
+          [ "$(has linux_x86)" = 1 ] && PK="$PK gcc-i686-linux-gnu"
 
-          if [ "$(has linux_aarch64)" = 1 ] || [ "$(has linux_armv7)" = 1 ]; then PK="$PK gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf"; fi
-          if [ "$(has linux_x86)" = 1 ]; then PK="$PK gcc-i686-linux-gnu"; fi
-          if [ "$(has and_x86_64)" = 1 ] || [ "$(has and_aarch64)" = 1 ] || [ "$(has and_armv7)" = 1 ] || [ "$(has and_x86)" = 1 ]; then PK="$PK musl-tools gcc-arm-linux-gnueabihf"; fi
-
+          rm -f /tmp/tgt.txt
           [ "$(has linux_aarch64)" = 1 ] && echo aarch64-unknown-linux-gnu >> /tmp/tgt.txt
           [ "$(has linux_armv7)"  = 1 ] && echo armv7-unknown-linux-gnueabihf >> /tmp/tgt.txt
           [ "$(has linux_x86)"    = 1 ] && echo i686-unknown-linux-gnu >> /tmp/tgt.txt
           [ "$(has bsd_x86_64)"   = 1 ] && echo x86_64-unknown-freebsd >> /tmp/tgt.txt
           [ "$(has bsd_aarch64)"  = 1 ] && echo aarch64-unknown-freebsd >> /tmp/tgt.txt
           [ "$(has bsd_x86)"      = 1 ] && echo i686-unknown-freebsd >> /tmp/tgt.txt
-          [ "$(has and_x86_64)"   = 1 ] && echo x86_64-unknown-linux-musl >> /tmp/tgt.txt
-          [ "$(has and_aarch64)"  = 1 ] && echo aarch64-unknown-linux-musl >> /tmp/tgt.txt
-          [ "$(has and_armv7)"    = 1 ] && echo armv7-unknown-linux-musleabihf >> /tmp/tgt.txt
-          [ "$(has and_x86)"      = 1 ] && echo i686-unknown-linux-musl >> /tmp/tgt.txt
+
+          # Android rust 目标（NDK 用）
+          [ "$(has and_x86_64)"   = 1 ] && echo x86_64-linux-android >> /tmp/tgt.txt
+          [ "$(has and_aarch64)"  = 1 ] && echo aarch64-linux-android >> /tmp/tgt.txt
+          [ "$(has and_armv7)"    = 1 ] && echo armv7-linux-androideabi >> /tmp/tgt.txt
+          [ "$(has and_x86)"      = 1 ] && echo i686-linux-android >> /tmp/tgt.txt
 
           [ -n "$PK" ] && { sudo apt-get update; sudo apt-get install -y $PK; }
           [ -s /tmp/tgt.txt ] && rustup target add $(tr '\n' ' ' < /tmp/tgt.txt)
 
-      - name: 写 .cargo/config.toml
+      - name: 写 .cargo/config.toml（仅 Linux/BSD，Android 交给 cargo-ndk）
         run: |
           set -euo pipefail
           I='${{ toJSON(inputs) }}'
@@ -87,22 +100,18 @@ jobs:
             [ "$(has linux_aarch64)" = 1 ] && { echo '[target.aarch64-unknown-linux-gnu]'; echo 'linker = "aarch64-linux-gnu-gcc"'; }
             [ "$(has linux_armv7)"  = 1 ] && { echo '[target.armv7-unknown-linux-gnueabihf]'; echo 'linker = "arm-linux-gnueabihf-gcc"'; }
             [ "$(has linux_x86)"    = 1 ] && { echo '[target.i686-unknown-linux-gnu]'; echo 'linker = "i686-linux-gnu-gcc"'; }
-            [ "$(has and_x86_64)"   = 1 ] && { echo '[target.x86_64-unknown-linux-musl]'; echo 'linker = "musl-gcc"'; }
-            [ "$(has and_aarch64)"  = 1 ] && { echo '[target.aarch64-unknown-linux-musl]'; echo 'linker = "musl-gcc"'; }
-            [ "$(has and_x86)"      = 1 ] && { echo '[target.i686-unknown-linux-musl]'; echo 'linker = "musl-gcc"'; }
-            [ "$(has and_armv7)"    = 1 ] && { echo '[target.armv7-unknown-linux-musleabihf]'; echo 'linker = "arm-linux-gnueabihf-gcc"'; }
             [ "$(has bsd_x86_64)"   = 1 ] && { echo '[target.x86_64-unknown-freebsd]'; echo 'linker = "zig"'; echo 'rustflags = ["-C", "link-arg=--target=x86_64-freebsd"]'; }
             [ "$(has bsd_aarch64)"  = 1 ] && { echo '[target.aarch64-unknown-freebsd]'; echo 'linker = "zig"'; echo 'rustflags = ["-C", "link-arg=--target=aarch64-freebsd"]'; }
             [ "$(has bsd_x86)"      = 1 ] && { echo '[target.i686-unknown-freebsd]'; echo 'linker = "zig"'; echo 'rustflags = ["-C", "link-arg=--target=i686-freebsd"]'; }
           } >> .cargo/config.toml
           cat .cargo/config.toml
 
-      - name: 构建
+      - name: 构建 Linux / BSD
         run: |
           set -euo pipefail
           BIN="${{ steps.pkg.outputs.bin }}"
           mkdir -p out
-          b(){ local t=$1 n=$2; cargo build --release --target "$t"; local s="target/$t/release/$BIN"; [ -f "$s.exe" ] && s="$s.exe"; cp "$s" "out/$n"; }
+          b(){ local t=$1 n=$2; cargo build --release --target "$t"; cp "target/$t/release/$BIN" "out/$n"; }
           I='${{ toJSON(inputs) }}'
           has(){ jq -r "if .$1 == true then \"1\" else \"0\" end" <<<"$I"; }
 
@@ -111,14 +120,25 @@ jobs:
           [ "$(has linux_armv7)"   = 1 ] && b armv7-unknown-linux-gnueabihf linux-armv7
           [ "$(has linux_x86)"     = 1 ] && b i686-unknown-linux-gnu linux-x86
 
-          [ "$(has and_x86_64)"    = 1 ] && b x86_64-unknown-linux-musl android-x86_64
-          [ "$(has and_aarch64)"   = 1 ] && b aarch64-unknown-linux-musl android-aarch64
-          [ "$(has and_armv7)"     = 1 ] && b armv7-unknown-linux-musleabihf android-armv7
-          [ "$(has and_x86)"       = 1 ] && b i686-unknown-linux-musl android-x86
-
           [ "$(has bsd_x86_64)"    = 1 ] && b x86_64-unknown-freebsd bsd-x86_64
           [ "$(has bsd_aarch64)"   = 1 ] && b aarch64-unknown-freebsd bsd-aarch64
           [ "$(has bsd_x86)"       = 1 ] && b i686-unknown-freebsd bsd-x86
+
+      - name: 构建 Android（cargo-ndk）
+        if: ${{ inputs.and_x86_64 || inputs.and_aarch64 || inputs.and_armv7 || inputs.and_x86 }}
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          BIN="${{ steps.pkg.outputs.bin }}"
+          I='${{ toJSON(inputs) }}'
+          has(){ jq -r "if .$1 == true then \"1\" else \"0\" end" <<<"$I"; }
+
+          [ "$(has and_aarch64)" = 1 ] && { cargo ndk -t arm64-v8a  -p 21 build --release --bin "$BIN"; cp "target/aarch64-linux-android/release/$BIN" out/android-aarch64; }
+          [ "$(has and_armv7)"   = 1 ] && { cargo ndk -t armeabi-v7a -p 21 build --release --bin "$BIN"; cp "target/armv7-linux-androideabi/release/$BIN" out/android-armv7; }
+          [ "$(has and_x86_64)"  = 1 ] && { cargo ndk -t x86_64     -p 21 build --release --bin "$BIN"; cp "target/x86_64-linux-android/release/$BIN" out/android-x86_64; }
+          [ "$(has and_x86)"     = 1 ] && { cargo ndk -t x86        -p 21 build --release --bin "$BIN"; cp "target/i686-linux-android/release/$BIN" out/android-x86; }
 
           ls -la out
 
@@ -130,19 +150,14 @@ jobs:
           name: Unix-like
           path: Unix-like.zip
 
-  # ===================== Windows =====================
-  Windows:
-    if: ${{ inputs.win_x86_64 || inputs.win_x86 }}
-    runs-on: windows-latest
+  # ===================== macOS =====================
+  macOS:
+    if: ${{ inputs.macos_aarch64 || inputs.macos_x86_64 }}
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: 加 32 位目标
-        run: |
-          if [ "${{ inputs.win_x86 }}" = "true" ]; then
-            rustup target add i686-pc-windows-msvc
-          fi
+      - run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
 
       - name: 读包名
         id: pkg
@@ -153,40 +168,8 @@ jobs:
 
       - name: 构建
         run: |
-          BIN="${{ steps.pkg.outputs.bin }}"
-          mkdir -p out
-          if [ "${{ inputs.win_x86_64 }}" = "true" ]; then
-            cargo build --release --target x86_64-pc-windows-msvc
-            cp "target/x86_64-pc-windows-msvc/release/$BIN.exe" "out/windows-x86_64.exe"
-          fi
-          if [ "${{ inputs.win_x86 }}" = "true" ]; then
-            cargo build --release --target i686-pc-windows-msvc
-            cp "target/i686-pc-windows-msvc/release/$BIN.exe" "out/windows-x86.exe"
-          fi
-          ls -la out
-
-      - name: 打包 Windows.zip
-        run: cd out && zip -r ../Windows.zip .
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Windows
-          path: Windows.zip
-
-  # ===================== macOS =====================
-  macOS:
-    if: ${{ inputs.macos_aarch64 || inputs.macos_x86_64 }}
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
-
-      - name: 构建
-        run: |
           set -euo pipefail
-          BIN=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^name[[:space:]]*=/{v=$0;sub(/^name[[:space:]]*=[[:space:]]*/,"",v);gsub(/[" \r]/,"",v);print v;exit}' Cargo.toml)
-          [ -z "$BIN" ] && { echo "::error::Cargo.toml 未找到 [package].name"; exit 1; }
+          BIN="${{ steps.pkg.outputs.bin }}"
           mkdir -p out
           if [ "${{ inputs.macos_x86_64 }}" = "true" ]; then
             cargo build --release --target x86_64-apple-darwin
