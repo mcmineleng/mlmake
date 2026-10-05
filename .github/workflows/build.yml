@@ -122,10 +122,13 @@ jobs:
 
           ls -la out
 
+      - name: 打包 Unix-like.zip
+        run: cd out && zip -r ../Unix-like.zip .
+
       - uses: actions/upload-artifact@v4
         with:
-          name: unix-like-bins
-          path: out/*
+          name: Unix-like
+          path: Unix-like.zip
 
   # ===================== Windows =====================
   Windows:
@@ -162,10 +165,13 @@ jobs:
           fi
           ls -la out
 
+      - name: 打包 Windows.zip
+        run: cd out && zip -r ../Windows.zip .
+
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-bins
-          path: out/*
+          name: Windows
+          path: Windows.zip
 
   # ===================== macOS =====================
   macOS:
@@ -192,31 +198,11 @@ jobs:
           fi
           ls out
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-bins
-          path: out/*
-
-  # ===================== 打包 =====================
-  打包:
-    needs: [Unix-like, Windows, macOS]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: allbins
-
-      - name: 汇总打包
-        run: |
-          mkdir -p dist
-          find allbins -type f -exec cp {} dist/ \;
-          cd dist
-          ls -la
-          zip -r ../builds.zip .
+      - name: 打包 macOS.zip
+        run: cd out && zip -r ../macOS.zip .
 
       - uses: actions/upload-artifact@v4
         with:
-          name: 全部构建产物
-          path: builds.zip
+          name: macOS
+          path: macOS.zip
 
