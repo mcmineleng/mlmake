@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 use brush_core::builtins::{self, Command};
 use brush_core::env::{EnvironmentLookup, EnvironmentScope};
@@ -110,15 +111,20 @@ fn log_line(show: bool, level: usize, label: &str, name: &str, status: String) {
     if !show {
         return;
     }
-    print!("\n");
     let indent = "    ".repeat(level);
     let c = match label {
         "TASK" => color::CYAN,
         "STEP" => color::BLUE,
         _ => color::RESET,
     };
-    println!(
-        "{indent}{BOLD}{c}{label}{RESET} : {name} {s}",
+    // raw mode 下 \n 只下移不回列 0，因此：
+    //   - 行首用 \r\x1b[K：回到列 0 并清掉当前行（吃掉 PTY 输出可能残留的半行）
+    //   - 行尾用 \r\n：下移一行并回到列 0
+    // 不要在前面再塞 \r\n，否则每条日志前会多出一个空行。
+    let mut out = std::io::stdout().lock();
+    let _ = write!(
+        out,
+        "\r\x1b[K{indent}{BOLD}{c}{label}{RESET} : {name} {s}\r\n",
         indent = indent,
         BOLD = color::BOLD,
         c = c,
@@ -127,33 +133,61 @@ fn log_line(show: bool, level: usize, label: &str, name: &str, status: String) {
         name = name,
         s = status,
     );
+    let _ = out.flush();
 }
 
 fn s_start() -> String { format!("{}[开始]{}", color::YELLOW, color::RESET) }
 fn s_ok() -> String { format!("{}[成功]{}", color::GREEN, color::RESET) }
 fn s_fail(c: i32) -> String { format!("{}[失败({})]{}", color::RED, c, color::RESET) }
+fn s_interrupt() -> String { format!("{}[中断(Ctrl+C)]{}", color::RED, color::RESET) }
 
-// ============== 终端 raw mode guard ==============
-/// RAII guard：进入时把本地终端设为 raw mode，drop 时恢复。
-/// 即使 task 执行期间 panic，终端也会被恢复。
+// 统一的错误输出（raw mode 下需要用 \r\n）
+fn err_line(msg: String) {
+    let mut out = std::io::stdout().lock();
+    let _ = write!(out, "\r\x1b[K{msg}\r\n");
+    let _ = out.flush();
+}
+
+// ============== 终端 raw mode guard（保留 ISIG） ==============
+/// RAII guard：进入时把本地终端设为 raw mode 但保留 ISIG（Ctrl+C 产生 SIGINT），
+/// drop 时恢复。即使 task 执行期间 panic，终端也会被恢复。
 struct RawModeGuard {
-    enabled: bool,
+    original: Option<libc::termios>,
 }
 
 impl RawModeGuard {
     fn enter() -> Self {
-        let enabled = std::io::stdin().is_terminal();
-        if enabled {
-            let _ = crossterm::terminal::enable_raw_mode();
+        if !std::io::stdin().is_terminal() {
+            return Self { original: None };
         }
-        Self { enabled }
+
+        unsafe {
+            let mut original: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut original) != 0 {
+                return Self { original: None };
+            }
+
+            let mut raw = original;
+            // cfmakeraw：关闭 ICANON/ECHO/IEXTEN 等，但会同时关掉 ISIG
+            libc::cfmakeraw(&mut raw);
+            // 手动把 ISIG 加回来 —— Ctrl+C 仍然产生 SIGINT
+            raw.c_lflag |= libc::ISIG;
+
+            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) != 0 {
+                return Self { original: None };
+            }
+
+            Self { original: Some(original) }
+        }
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        if self.enabled {
-            let _ = crossterm::terminal::disable_raw_mode();
+        if let Some(ref orig) = self.original {
+            unsafe {
+                let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, orig);
+            }
         }
     }
 }
@@ -288,10 +322,10 @@ impl Command for GetallvarCommand {
                 .map_err(brush_core::Error::from)?;
             Ok(ExecutionResult::success())
         } else {
-            eprintln!(
+            err_line(format!(
                 "{}[错误] 全局变量池中不存在: {}{}",
                 color::RED, self.name, color::RESET
-            );
+            ));
             Ok(ExecutionResult::new(1))
         }
     }
@@ -323,7 +357,7 @@ impl Command for ListallvarCommand {
 
         if self.names_only && !self.values {
             for k in e.global_vars.keys() {
-                println!("{}", k);
+                err_line(k.clone());
             }
         } else if !self.names_only && self.values {
             let parts: Vec<String> = e
@@ -331,14 +365,14 @@ impl Command for ListallvarCommand {
                 .iter()
                 .map(|(k, v)| format!("{}={}", k, v))
                 .collect();
-            println!("{}", parts.join(" "));
+            err_line(parts.join(" "));
         } else if self.names_only && self.values {
             for (k, v) in &e.global_vars {
-                println!("{}={}", k, v);
+                err_line(format!("{}={}", k, v));
             }
         } else {
             let keys: Vec<&str> = e.global_vars.keys().map(|s| s.as_str()).collect();
-            println!("{}", keys.join(" "));
+            err_line(keys.join(" "));
         }
 
         Ok(ExecutionResult::success())
@@ -349,6 +383,7 @@ impl Command for ListallvarCommand {
 async fn create_shell_with_pty(
     args: &[String],
     pts: Option<Arc<pty_process::blocking::Pts>>,
+    arg0: &str,
 ) -> Result<BrushShell, String> {
     let mut builtins_map =
         brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode);
@@ -389,6 +424,9 @@ async fn create_shell_with_pty(
         .await
         .map_err(|e| format!("创建 shell 失败: {}", e))?;
 
+    // $0 设为任务名（或其它调用者指定的名称）
+    shell.shell_name = Some(arg0.to_string());
+    // 位置参数：$1, $2, ...
     shell.positional_parameters = args.to_vec();
     Ok(shell)
 }
@@ -403,17 +441,20 @@ async fn execute_task(
         let mut e = engine.lock().await;
         if let Some(max) = e.max_depth {
             if e.task_depth >= max {
-                eprintln!(
+                err_line(format!(
                     "{}[错误] task 递归深度超限 ({}): {}{}",
                     color::RED, max, value, color::RESET
-                );
+                ));
                 return Err(1);
             }
         }
         let t = match e.tasks.get(value) {
             Some(t) => t.clone(),
             None => {
-                eprintln!("{}[错误] 找不到 task: {}{}", color::RED, value, color::RESET);
+                err_line(format!(
+                    "{}[错误] 找不到 task: {}{}",
+                    color::RED, value, color::RESET
+                ));
                 return Err(127);
             }
         };
@@ -428,7 +469,10 @@ async fn execute_task(
     let (pty, pts) = match pty_process::blocking::open() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("{}[错误] 打开 pty 失败: {}{}", color::RED, e, color::RESET);
+            err_line(format!(
+                "{}[错误] 打开 pty 失败: {}{}",
+                color::RED, e, color::RESET
+            ));
             let mut e = engine.lock().await;
             e.task_depth -= 1;
             log_line(actioninfo, 0, "TASK", &task.name, s_fail(1));
@@ -436,21 +480,52 @@ async fn execute_task(
         }
     };
 
-    // ── 同步 PTY 尺寸到当前终端，保证 soft-wrap / \r 覆盖正确 ──
+    // ── 同步 PTY 尺寸到当前终端 ──
     if let Ok((cols, rows)) = crossterm::terminal::size() {
         let _ = pty.resize(pty_process::Size::new(rows, cols));
     }
 
     let pts = Arc::new(pts);
 
-    // ── 进入 raw mode（RAII，guard drop 时自动恢复） ──
-    let _raw_guard = RawModeGuard::enter();
+    // ── 进入 raw mode（保留 ISIG） ──
+    let raw_guard = RawModeGuard::enter();
+
+    // ── 监听 SIGINT（Ctrl+C）──
+    // 收到后：恢复终端 → 打印中断日志 → 直接退出进程（130 = 128+SIGINT）
+    let ctrl_c_task_name = task.name.clone();
+    let ctrl_c_actioninfo = actioninfo;
+    let ctrl_c_handle = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            // 恢复终端（不要用 RAII，直接就地恢复，避免退出时还处于 raw mode）
+            unsafe {
+                let mut term: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(libc::STDIN_FILENO, &mut term) == 0 {
+                    libc::cfmakeraw(&mut term);
+                    // 加回最常用的几个 flag，恢复"正常"终端
+                    term.c_lflag |= libc::ICANON | libc::ECHO | libc::ISIG;
+                    term.c_oflag |= libc::OPOST;
+                    libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &term);
+                }
+            }
+            log_line(
+                ctrl_c_actioninfo,
+                0,
+                "TASK",
+                &ctrl_c_task_name,
+                s_interrupt(),
+            );
+            // 强制退出整个进程
+            std::process::exit(130);
+        }
+    });
 
     // ── reader 线程：PTY master → stdout ──
     let raw_fd = pty.as_raw_fd();
     let dup_fd = unsafe { libc::dup(raw_fd) };
     if dup_fd < 0 {
-        eprintln!("{}[错误] dup pty fd 失败{}", color::RED, color::RESET);
+        err_line(format!("{}[错误] dup pty fd 失败{}", color::RED, color::RESET));
+        drop(raw_guard);
+        ctrl_c_handle.abort();
         let mut e = engine.lock().await;
         e.task_depth -= 1;
         log_line(actioninfo, 0, "TASK", &task.name, s_fail(1));
@@ -487,8 +562,14 @@ async fn execute_task(
                 match stdin.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        // Ctrl+] 脱离
                         if buf[..n].contains(&0x1d) {
                             break;
+                        }
+                        // 保险：ISIG 已开启时 0x03 通常到不了这里；
+                        // 若某些终端不产生 SIGINT，则自己中断。
+                        if buf[..n].contains(&0x03) {
+                            std::process::exit(130);
                         }
                         if writer.write_all(&buf[..n]).is_err() {
                             break;
@@ -503,13 +584,15 @@ async fn execute_task(
         None
     };
 
-    // ── 创建绑定到 PTY 的 shell ──
-    let mut shell = match create_shell_with_pty(args, Some(pts)).await {
+    // ── 创建绑定到 PTY 的 shell（$0 = task.value） ──
+    let mut shell = match create_shell_with_pty(args, Some(pts), &task.value).await {
         Ok(s) => s,
         Err(err) => {
-            eprintln!("{}[错误] {} {}", color::RED, err, color::RESET);
+            err_line(format!("{}[错误] {} {}", color::RED, err, color::RESET));
             drop(pty);
             let _ = reader_thread.join();
+            ctrl_c_handle.abort();
+            drop(raw_guard);
             let mut e = engine.lock().await;
             e.task_depth -= 1;
             log_line(actioninfo, 0, "TASK", &task.name, s_fail(127));
@@ -525,12 +608,16 @@ async fn execute_task(
     drop(pty);
     let _ = reader_thread.join();
 
+    // 取消 SIGINT 监听（如果没触发，则正常取消）
+    ctrl_c_handle.abort();
+
     // writer 线程可能仍阻塞在 stdin.read() 上，让它在进程结束时自动消失。
     if let Some(t) = _writer_thread {
         let _ = t;
     }
 
-    // _raw_guard 在此处 drop，恢复终端
+    // 恢复终端
+    drop(raw_guard);
 
     {
         let mut e = engine.lock().await;
@@ -596,7 +683,7 @@ async fn run_one(a: &Action, shell: &mut BrushShell) -> Result<(), i32> {
             if code == 0 { Ok(()) } else { Err(code) }
         }
         Err(e) => {
-            eprintln!("{}[错误] 执行失败: {}{}", color::RED, e, color::RESET);
+            err_line(format!("{}[错误] 执行失败: {}{}", color::RED, e, color::RESET));
             Err(1)
         }
     }
@@ -630,6 +717,8 @@ fn print_help() {
             "  同一个 task 的所有命令共享同一个 PTY 终端，stdin/stdout 双向转发，\n",
             "  支持 read -p、vim、top 等交互式程序。\n",
             "  交互中按 Ctrl-] 可脱离当前 PTY 会话。\n",
+            "  交互中按 Ctrl+C 可中止当前 task（并退出 mlmake）。\n",
+            "  参数传递：$0 = task.value，$1..$n = 命令行附加参数。\n",
             "  全局变量池没有任何自动同步：\n",
             "    写入请用 setallvar <name> <value>\n",
             "    读取请用 getallvar <name>（会设为当前 shell 变量）\n",
@@ -650,7 +739,10 @@ fn load_build(cfg_path: &str) -> BuildFile {
     let content = match std::fs::read_to_string(cfg_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("{}[错误] 读 {}: {}{}", color::RED, cfg_path, e, color::RESET);
+            eprintln!(
+                "{}[错误] 读 {}: {}{}",
+                color::RED, cfg_path, e, color::RESET
+            );
             std::process::exit(1);
         }
     };
@@ -678,7 +770,10 @@ fn cmd_list(b: &BuildFile, args: &[String]) {
     }
     if args[0] == "all" && args.get(1).map(|s| s.as_str()) == Some("step") {
         for t in &b.tasks {
-            println!("{}TASK{} : {} ({})", color::CYAN, color::RESET, t.name, t.value);
+            println!(
+                "{}TASK{} : {} ({})",
+                color::CYAN, color::RESET, t.name, t.value
+            );
             for s in &t.steps {
                 println!("    {}STEP{} : {}", color::BLUE, color::RESET, s.name);
             }
@@ -688,13 +783,19 @@ fn cmd_list(b: &BuildFile, args: &[String]) {
     if args.get(1).map(|s| s.as_str()) == Some("step") {
         match b.tasks.iter().find(|t| t.value == args[0]) {
             Some(t) => {
-                println!("{}TASK{} : {} ({})", color::CYAN, color::RESET, t.name, t.value);
+                println!(
+                    "{}TASK{} : {} ({})",
+                    color::CYAN, color::RESET, t.name, t.value
+                );
                 for s in &t.steps {
                     println!("    {}STEP{} : {}", color::BLUE, color::RESET, s.name);
                 }
             }
             None => {
-                eprintln!("{}[错误] 找不到 task: {}{}", color::RED, args[0], color::RESET);
+                eprintln!(
+                    "{}[错误] 找不到 task: {}{}",
+                    color::RED, args[0], color::RESET
+                );
                 std::process::exit(1);
             }
         }
@@ -718,11 +819,19 @@ async fn main() {
         args.drain(1..3);
     }
 
-    if args.get(1).map(|s| s == "--version" || s == "-V").unwrap_or(false) {
+    if args
+        .get(1)
+        .map(|s| s == "--version" || s == "-V")
+        .unwrap_or(false)
+    {
         println!("{} v{}", PKG_NAME, VERSION);
         return;
     }
-    if args.get(1).map(|s| s == "--help" || s == "-h").unwrap_or(false) {
+    if args
+        .get(1)
+        .map(|s| s == "--help" || s == "-h")
+        .unwrap_or(false)
+    {
         print_help();
         return;
     }
@@ -756,7 +865,10 @@ async fn main() {
     let task = match build.tasks.iter().find(|t| t.value == target) {
         Some(t) => t,
         None => {
-            eprintln!("{}[错误] 找不到 task: {}{}", color::RED, target, color::RESET);
+            eprintln!(
+                "{}[错误] 找不到 task: {}{}",
+                color::RED, target, color::RESET
+            );
             std::process::exit(1);
         }
     };
