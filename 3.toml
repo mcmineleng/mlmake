@@ -1,0 +1,10 @@
+[[task]]
+name = "测试"
+value = "test"
+cmduse = true
+
+[[task.step]]
+name = "s1"
+
+[[task.step.action]]
+run = 'echo "0=$0 1=$1 2=$2 #=$# @=$@"'

@@ -1,10 +1,21 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::sync::mpsc::{self, Sender};
-use std::thread;
+use std::io::{IsTerminal, Read, Write};
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::sync::{Arc, OnceLock};
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use brush_core::builtins::{self, Command};
+use brush_core::env::{EnvironmentLookup, EnvironmentScope};
+use brush_core::openfiles::OpenFile;
+use brush_core::variables::ShellValueLiteral;
+use brush_core::{
+    CreateOptions, ExecutionContext, ExecutionParameters, ExecutionResult,
+    Shell as BrushShell, ShellFd,
+};
+use clap::Parser;
 use serde::Deserialize;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const PKG_NAME: &str = env!("CARGO_PKG_NAME");
 
 mod color {
     pub const RESET: &str = "\x1b[0m";
@@ -17,20 +28,66 @@ mod color {
     pub const DIM: &str = "\x1b[2m";
 }
 
+fn default_true() -> bool { true }
+
+// ============== max_depth 设置类型 ==============
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+enum MaxDepthSetting {
+    Bool(bool),
+    Num(usize),
+}
+
+impl Default for MaxDepthSetting {
+    fn default() -> Self { MaxDepthSetting::Num(64) }
+}
+
+fn default_max_depth() -> MaxDepthSetting { MaxDepthSetting::Num(64) }
+
+// ============== 配置结构 ==============
+#[derive(Debug, Deserialize, Clone, Default)]
+struct TaskSettings {
+    #[serde(default)]
+    actioninfo: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct GlobalSettings {
+    #[serde(default = "default_true")]
+    actioninfo: bool,
+    #[serde(default = "default_max_depth")]
+    max_depth: MaxDepthSetting,
+}
+
+impl Default for GlobalSettings {
+    fn default() -> Self {
+        Self {
+            actioninfo: true,
+            max_depth: MaxDepthSetting::Num(64),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct BuildFile {
     #[serde(rename = "task", default)]
     tasks: Vec<Task>,
+    #[serde(default)]
+    settings: GlobalSettings,
 }
+
 #[derive(Debug, Deserialize, Clone)]
 struct Task {
     name: String,
     value: String,
     #[serde(default)]
     cmduse: bool,
+    #[serde(default)]
+    settings: TaskSettings,
     #[serde(rename = "step", default)]
     steps: Vec<Step>,
 }
+
 #[derive(Debug, Deserialize, Clone)]
 struct Step {
     name: String,
@@ -39,16 +96,20 @@ struct Step {
     #[serde(rename = "action", default)]
     actions: Vec<Action>,
 }
+
 #[derive(Debug, Deserialize, Clone)]
 struct Action {
     #[serde(default)]
     #[allow(dead_code)]
     require_success: bool,
-    run: Option<String>,
-    builtin: Option<Vec<String>>,
+    run: String,
 }
 
-fn log_line(level: usize, label: &str, name: &str, status: String) {
+// ============== 日志 ==============
+fn log_line(show: bool, level: usize, label: &str, name: &str, status: String) {
+    if !show {
+        return;
+    }
     print!("\n");
     let indent = "    ".repeat(level);
     let c = match label {
@@ -67,320 +128,61 @@ fn log_line(level: usize, label: &str, name: &str, status: String) {
         s = status,
     );
 }
+
 fn s_start() -> String { format!("{}[开始]{}", color::YELLOW, color::RESET) }
 fn s_ok() -> String { format!("{}[成功]{}", color::GREEN, color::RESET) }
 fn s_fail(c: i32) -> String { format!("{}[失败({})]{}", color::RED, c, color::RESET) }
 
-const SENTINEL_PREFIX: &str = "__MLMAKE_END_";
-const SENTINEL_SUFFIX: &str = "__";
-const HS_MARK: &str = "__MLMAKE_HS__";
+// ============== 终端 raw mode guard ==============
+/// RAII guard：进入时把本地终端设为 raw mode，drop 时恢复。
+/// 即使 task 执行期间 panic，终端也会被恢复。
+struct RawModeGuard {
+    enabled: bool,
+}
 
-// ============== 终端尺寸 ==============
-
-#[cfg(unix)]
-fn term_size() -> (u16, u16) {
-    use std::os::unix::io::AsRawFd;
-    let fd = std::io::stdin().as_raw_fd();
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0
-            && ws.ws_col > 0
-            && ws.ws_row > 0
-        {
-            return (ws.ws_row, ws.ws_col);
+impl RawModeGuard {
+    fn enter() -> Self {
+        let enabled = std::io::stdin().is_terminal();
+        if enabled {
+            let _ = crossterm::terminal::enable_raw_mode();
         }
-    }
-    (24, 80)
-}
-
-#[cfg(not(unix))]
-fn term_size() -> (u16, u16) { (24, 80) }
-
-// ============== 字节工具 ==============
-
-fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return None;
-    }
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-
-fn partial_suffix_match_len(data: &[u8], prefix: &[u8]) -> usize {
-    let max = data.len().min(prefix.len().saturating_sub(1));
-    for len in (1..=max).rev() {
-        if data[data.len() - len..] == prefix[..len] {
-            return len;
-        }
-    }
-    0
-}
-
-// ============== 握手 ==============
-
-fn drain_until_handshake(r: &mut dyn Read) {
-    let mut buf = [0u8; 1024];
-    let mut acc: Vec<u8> = Vec::new();
-    let hs = HS_MARK.as_bytes();
-    loop {
-        match r.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                acc.extend_from_slice(&buf[..n]);
-                if find_subslice(&acc, hs).is_some() {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
+        Self { enabled }
     }
 }
 
-// ============== 常驻 PTY shell ==============
-
-struct PersistentShell {
-    child: Box<dyn portable_pty::Child>,
-    master: Box<dyn Write + Send>,
-    code_rx: mpsc::Receiver<i32>,
-}
-
-impl PersistentShell {
-    fn spawn(_task_name: &str, cwd: Option<&str>) -> std::io::Result<Self> {
-        let pty = native_pty_system();
-
-        // ★ 关键：PTY 宽度必须等于用户终端宽度，否则 cargo 输出 soft-wrap，
-        //    \r 只会回到最后一个物理行的行首，看起来像每帧新起一行。
-        let (rows, cols) = term_size();
-
-        let pair = pty
-            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))?;
-
-        let mut cmd = CommandBuilder::new("sh");
-        let cwd_path = match cwd {
-            Some(d) => std::path::PathBuf::from(d),
-            None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        };
-        cmd.cwd(&cwd_path);
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("PS1", "");
-        cmd.env("PS2", "");
-        cmd.env("PROMPT_COMMAND", "");
-
-        let child = pair.slave.spawn_command(cmd)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))?;
-        drop(pair.slave);
-
-        let mut master = pair.master.take_writer().unwrap();
-        let mut r0 = pair.master.try_clone_reader().unwrap();
-
-        // 关回显；开输出处理；\n -> \r\n；不动 \r（保证进度条能回行首）
-        master.write_all(b"stty -echo opost onlcr -ocrnl\n")?;
-        // HS 标记在命令文本里拆开：回显是 echo __MLMA"KE_HS"__，输出是 __MLMAKE_HS__
-        master.write_all(b"echo __MLMA\"KE_HS\"__\n")?;
-        master.flush()?;
-        drain_until_handshake(&mut r0);
-        drop(r0);
-
-        let reader = pair.master.try_clone_reader().unwrap();
-        let (code_tx, code_rx) = mpsc::channel();
-        spawn_pty_reader(reader, code_tx);
-
-        Ok(Self { child, master, code_rx })
-    }
-
-    fn run_script(&mut self, script: &str) -> std::io::Result<i32> {
-        // 哨兵同样拆开：回显是 echo __MLMA"KE_END_$?"__，输出是 __MLMAKE_END_<code>__
-        let wrapped = format!("{script}\necho __MLMA\"KE_END_$?\"__\n");
-        self.master.write_all(wrapped.as_bytes())?;
-        self.master.flush()?;
-        Ok(self.code_rx.recv().unwrap_or(-1))
-    }
-
-    fn set_args(&mut self, args: &[String]) -> std::io::Result<()> {
-        let mut l = String::from("set --");
-        for a in args {
-            l.push(' ');
-            l.push_str(&shell_quote(a));
-        }
-        l.push('\n');
-        self.master.write_all(l.as_bytes())?;
-        self.master.flush()?;
-        Ok(())
-    }
-}
-
-impl Drop for PersistentShell {
+impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        let _ = self.master.flush();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-// ============== PTY reader：纯字节透传 ==============
-
-fn spawn_pty_reader<R: Read + Send + 'static>(mut r: R, code_tx: Sender<i32>) {
-    thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        let mut pending: Vec<u8> = Vec::new();
-        let prefix = SENTINEL_PREFIX.as_bytes();
-        let suffix = SENTINEL_SUFFIX.as_bytes();
-
-        let stdout = std::io::stdout();
-
-        macro_rules! emit {
-            ($bytes:expr) => {{
-                let b: &[u8] = $bytes;
-                if !b.is_empty() {
-                    let mut lock = stdout.lock();
-                    let _ = lock.write_all(b);
-                    let _ = lock.flush();
-                }
-            }};
-        }
-
-        loop {
-            let n = match r.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            pending.extend_from_slice(&buf[..n]);
-
-            'scan: loop {
-                match find_subslice(&pending, prefix) {
-                    Some(p) => {
-                        let after = p + prefix.len();
-                        match find_subslice(&pending[after..], suffix) {
-                            Some(rel) => {
-                                emit!(&pending[..p]);
-
-                                let code_end = after + rel;
-                                let code = std::str::from_utf8(&pending[after..code_end])
-                                    .unwrap_or("")
-                                    .trim()
-                                    .to_string();
-                                if let Ok(c) = code.parse::<i32>() {
-                                    let _ = code_tx.send(c);
-                                }
-
-                                let mut next = code_end + suffix.len();
-                                if next < pending.len() && pending[next] == b'\n' {
-                                    next += 1;
-                                }
-                                pending.drain(..next);
-                                continue 'scan;
-                            }
-                            None => {
-                                emit!(&pending[..p]);
-                                pending.drain(..p);
-                                break 'scan;
-                            }
-                        }
-                    }
-                    None => {
-                        let keep = partial_suffix_match_len(&pending, prefix);
-                        let emit_len = pending.len() - keep;
-                        if emit_len > 0 {
-                            emit!(&pending[..emit_len]);
-                            pending.drain(..emit_len);
-                        }
-                        break 'scan;
-                    }
-                }
-            }
-        }
-
-        if !pending.is_empty() {
-            emit!(&pending);
-        }
-        let _ = stdout.lock().flush();
-    });
-}
-
-// ============== shell 引用 / 变量展开 ==============
-
-fn shell_quote(s: &str) -> String {
-    if s.is_empty() {
-        return "''".to_string();
-    }
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:@%+".contains(c)) {
-        return s.to_string();
-    }
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-fn expand_vars(s: &str, args: &[String]) -> String {
-    let ch: Vec<char> = s.chars().collect();
-    let mut out = String::new();
-    let mut i = 0;
-    while i < ch.len() {
-        if ch[i] == '$' && i + 1 < ch.len() {
-            match ch[i + 1] {
-                '@' => { out.push_str(&args.join(" ")); i += 2; continue; }
-                '$' => { out.push('$'); i += 2; continue; }
-                d if d.is_ascii_digit() => {
-                    let n = d.to_digit(10).unwrap() as usize;
-                    if n >= 1 && n <= args.len() {
-                        out.push_str(&args[n - 1]);
-                    }
-                    i += 2;
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        out.push(ch[i]);
-        i += 1;
-    }
-    out
-}
-
-fn split_quoted(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut sq = false;
-    let mut dq = false;
-    let mut has = false;
-    for c in s.chars() {
-        match c {
-            '\'' if !dq => { sq = !sq; has = true; }
-            '"' if !sq => { dq = !dq; has = true; }
-            ' ' | '\t' | '\n' if !sq && !dq => {
-                if has { out.push(std::mem::take(&mut cur)); has = false; }
-            }
-            _ => { cur.push(c); has = true; }
+        if self.enabled {
+            let _ = crossterm::terminal::disable_raw_mode();
         }
     }
-    if has { out.push(cur); }
-    out
 }
 
-// ============== 内建 ==============
-
-type BuiltinFn = fn(&mut Engine, &[String]) -> Result<(), i32>;
-fn builtin_table() -> HashMap<&'static str, BuiltinFn> {
-    let mut m = HashMap::new();
-    m.insert("task", builtin_task as BuiltinFn);
-    m
-}
-fn builtin_task(e: &mut Engine, args: &[String]) -> Result<(), i32> {
-    if args.is_empty() {
-        eprintln!("{}[builtin task] 缺参数{}", color::RED, color::RESET);
-        return Err(1);
-    }
-    e.execute_task(&args[0], &args[1..])
-}
-
-// ============== 引擎 ==============
-
+// ============== Engine ==============
 struct Engine {
     tasks: HashMap<String, Task>,
-    current_args: Vec<String>,
+    global_vars: HashMap<String, String>,
+    global_actioninfo: bool,
+    task_depth: usize,
+    max_depth: Option<usize>,
 }
 
 impl Engine {
-    fn new(tasks: Vec<Task>) -> Result<Self, String> {
+    fn new(
+        tasks: Vec<Task>,
+        global_actioninfo: bool,
+        max_depth: MaxDepthSetting,
+    ) -> Result<Self, String> {
+        let max_depth = match max_depth {
+            MaxDepthSetting::Num(n) => Some(n),
+            MaxDepthSetting::Bool(false) => None,
+            MaxDepthSetting::Bool(true) => {
+                return Err(
+                    "settings.max_depth 为布尔值时只能为 false（表示不限制递归）".to_string(),
+                );
+            }
+        };
+
         let mut map = HashMap::new();
         for t in tasks {
             let key = t.value.clone();
@@ -389,108 +191,418 @@ impl Engine {
             }
             map.insert(key, t);
         }
-        Ok(Self { tasks: map, current_args: Vec::new() })
+        Ok(Self {
+            tasks: map,
+            global_vars: HashMap::new(),
+            global_actioninfo,
+            task_depth: 0,
+            max_depth,
+        })
     }
+}
 
-    fn execute_task(&mut self, value: &str, args: &[String]) -> Result<(), i32> {
-        let (name, steps) = match self.tasks.get(value) {
-            Some(t) => (t.name.clone(), t.steps.clone()),
+// ============== 全局 Engine ==============
+static ENGINE: OnceLock<Arc<tokio::sync::Mutex<Engine>>> = OnceLock::new();
+
+fn get_engine() -> Arc<tokio::sync::Mutex<Engine>> {
+    ENGINE.get().expect("Engine 未初始化").clone()
+}
+
+// ============== 内建命令：task ==============
+#[derive(Parser, Debug)]
+#[command(name = "task", about = "调用一个 task")]
+struct TaskCommand {
+    #[arg(required = true)]
+    target: String,
+    #[arg(trailing_var_arg = true)]
+    args: Vec<String>,
+}
+
+impl Command for TaskCommand {
+    type Error = brush_core::Error;
+
+    async fn execute(
+        &self,
+        _context: ExecutionContext<'_>,
+    ) -> Result<ExecutionResult, Self::Error> {
+        let engine = get_engine();
+        match execute_task(engine, &self.target, &self.args).await {
+            Ok(()) => Ok(ExecutionResult::success()),
+            Err(code) => Ok(ExecutionResult::new(code as u8)),
+        }
+    }
+}
+
+// ============== 内建命令：setallvar ==============
+#[derive(Parser, Debug)]
+#[command(name = "setallvar", about = "将变量设置到全局变量池（唯一写入入口）")]
+struct SetallvarCommand {
+    #[arg(required = true)]
+    name: String,
+    #[arg(required = true)]
+    value: String,
+}
+
+impl Command for SetallvarCommand {
+    type Error = brush_core::Error;
+
+    async fn execute(
+        &self,
+        _context: ExecutionContext<'_>,
+    ) -> Result<ExecutionResult, Self::Error> {
+        let engine = get_engine();
+        let mut e = engine.lock().await;
+        e.global_vars.insert(self.name.clone(), self.value.clone());
+        Ok(ExecutionResult::success())
+    }
+}
+
+// ============== 内建命令：getallvar ==============
+#[derive(Parser, Debug)]
+#[command(name = "getallvar", about = "从全局变量池读取变量并设为当前 shell 变量（唯一读取入口）")]
+struct GetallvarCommand {
+    #[arg(required = true)]
+    name: String,
+}
+
+impl Command for GetallvarCommand {
+    type Error = brush_core::Error;
+
+    async fn execute(
+        &self,
+        context: ExecutionContext<'_>,
+    ) -> Result<ExecutionResult, Self::Error> {
+        let engine = get_engine();
+        let e = engine.lock().await;
+        if let Some(val) = e.global_vars.get(&self.name) {
+            context
+                .shell
+                .env
+                .update_or_add(
+                    self.name.as_str(),
+                    ShellValueLiteral::Scalar(val.clone()),
+                    |_| Ok(()),
+                    EnvironmentLookup::Anywhere,
+                    EnvironmentScope::Global,
+                )
+                .map_err(brush_core::Error::from)?;
+            Ok(ExecutionResult::success())
+        } else {
+            eprintln!(
+                "{}[错误] 全局变量池中不存在: {}{}",
+                color::RED, self.name, color::RESET
+            );
+            Ok(ExecutionResult::new(1))
+        }
+    }
+}
+
+// ============== 内建命令：listallvar ==============
+#[derive(Parser, Debug)]
+#[command(name = "listallvar", about = "列出全局变量池中的所有变量")]
+struct ListallvarCommand {
+    #[arg(short = 'n')]
+    names_only: bool,
+    #[arg(short = 'v')]
+    values: bool,
+}
+
+impl Command for ListallvarCommand {
+    type Error = brush_core::Error;
+
+    async fn execute(
+        &self,
+        _context: ExecutionContext<'_>,
+    ) -> Result<ExecutionResult, Self::Error> {
+        let engine = get_engine();
+        let e = engine.lock().await;
+
+        if e.global_vars.is_empty() {
+            return Ok(ExecutionResult::success());
+        }
+
+        if self.names_only && !self.values {
+            for k in e.global_vars.keys() {
+                println!("{}", k);
+            }
+        } else if !self.names_only && self.values {
+            let parts: Vec<String> = e
+                .global_vars
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+            println!("{}", parts.join(" "));
+        } else if self.names_only && self.values {
+            for (k, v) in &e.global_vars {
+                println!("{}={}", k, v);
+            }
+        } else {
+            let keys: Vec<&str> = e.global_vars.keys().map(|s| s.as_str()).collect();
+            println!("{}", keys.join(" "));
+        }
+
+        Ok(ExecutionResult::success())
+    }
+}
+
+// ============== 创建绑定到 PTY 的 shell ==============
+async fn create_shell_with_pty(
+    args: &[String],
+    pts: Option<Arc<pty_process::blocking::Pts>>,
+) -> Result<BrushShell, String> {
+    let mut builtins_map =
+        brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode);
+
+    builtins_map.insert("task".into(), builtins::builtin::<TaskCommand>());
+    builtins_map.insert("setallvar".into(), builtins::builtin::<SetallvarCommand>());
+    builtins_map.insert("getallvar".into(), builtins::builtin::<GetallvarCommand>());
+    builtins_map.insert("listallvar".into(), builtins::builtin::<ListallvarCommand>());
+
+    let fds = if let Some(pts) = pts {
+        let pts_fd = pts.as_raw_fd();
+        let mut map = HashMap::new();
+        for target in 0..3 {
+            let d = unsafe { libc::dup(pts_fd) };
+            if d < 0 {
+                return Err("dup pty slave 失败".to_string());
+            }
+            let file = unsafe { std::fs::File::from_raw_fd(d) };
+            map.insert(target as ShellFd, OpenFile::from(file));
+        }
+        Some(map)
+    } else {
+        None
+    };
+
+    let options = CreateOptions {
+        no_editing: true,
+        no_profile: true,
+        no_rc: true,
+        interactive: true,
+        login: false,
+        builtins: builtins_map,
+        fds,
+        ..Default::default()
+    };
+
+    let mut shell = BrushShell::new(options)
+        .await
+        .map_err(|e| format!("创建 shell 失败: {}", e))?;
+
+    shell.positional_parameters = args.to_vec();
+    Ok(shell)
+}
+
+// ============== 执行 task ==============
+async fn execute_task(
+    engine: Arc<tokio::sync::Mutex<Engine>>,
+    value: &str,
+    args: &[String],
+) -> Result<(), i32> {
+    let (task, actioninfo) = {
+        let mut e = engine.lock().await;
+        if let Some(max) = e.max_depth {
+            if e.task_depth >= max {
+                eprintln!(
+                    "{}[错误] task 递归深度超限 ({}): {}{}",
+                    color::RED, max, value, color::RESET
+                );
+                return Err(1);
+            }
+        }
+        let t = match e.tasks.get(value) {
+            Some(t) => t.clone(),
             None => {
                 eprintln!("{}[错误] 找不到 task: {}{}", color::RED, value, color::RESET);
                 return Err(127);
             }
         };
-        log_line(0, "TASK", &name, s_start());
+        e.task_depth += 1;
+        let ai = t.settings.actioninfo.unwrap_or(e.global_actioninfo);
+        (t, ai)
+    };
 
-        let mut shell = match PersistentShell::spawn(&name, None) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("{}[错误] pty 启动失败: {}{}", color::RED, e, color::RESET);
-                log_line(0, "TASK", &name, s_fail(127));
-                return Err(127);
-            }
-        };
-        let _ = shell.set_args(args);
-        let saved = std::mem::replace(&mut self.current_args, args.to_vec());
-        let r = self.run_steps(&steps, &mut shell);
-        self.current_args = saved;
+    log_line(actioninfo, 0, "TASK", &task.name, s_start());
 
-        match &r {
-            Ok(()) => log_line(0, "TASK", &name, s_ok()),
-            Err(c) => log_line(0, "TASK", &name, s_fail(*c)),
+    // ── 打开 PTY ──
+    let (pty, pts) = match pty_process::blocking::open() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}[错误] 打开 pty 失败: {}{}", color::RED, e, color::RESET);
+            let mut e = engine.lock().await;
+            e.task_depth -= 1;
+            log_line(actioninfo, 0, "TASK", &task.name, s_fail(1));
+            return Err(1);
         }
-        r
+    };
+
+    // ── 同步 PTY 尺寸到当前终端，保证 soft-wrap / \r 覆盖正确 ──
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        let _ = pty.resize(pty_process::Size::new(rows, cols));
     }
 
-    fn run_steps(&mut self, steps: &[Step], shell: &mut PersistentShell) -> Result<(), i32> {
-        let mut last: Option<Result<(), i32>> = None;
-        for st in steps {
-            if st.require_success {
-                if let Some(Err(c)) = last {
-                    log_line(1, "STEP", &st.name, s_fail(c));
-                    last = Some(Err(c));
-                    continue;
+    let pts = Arc::new(pts);
+
+    // ── 进入 raw mode（RAII，guard drop 时自动恢复） ──
+    let _raw_guard = RawModeGuard::enter();
+
+    // ── reader 线程：PTY master → stdout ──
+    let raw_fd = pty.as_raw_fd();
+    let dup_fd = unsafe { libc::dup(raw_fd) };
+    if dup_fd < 0 {
+        eprintln!("{}[错误] dup pty fd 失败{}", color::RED, color::RESET);
+        let mut e = engine.lock().await;
+        e.task_depth -= 1;
+        log_line(actioninfo, 0, "TASK", &task.name, s_fail(1));
+        return Err(1);
+    }
+    let mut reader = unsafe { std::fs::File::from_raw_fd(dup_fd) };
+
+    let reader_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let stdout = std::io::stdout();
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut lock = stdout.lock();
+                    let _ = lock.write_all(&buf[..n]);
+                    let _ = lock.flush();
                 }
+                Err(_) => break,
             }
-            log_line(1, "STEP", &st.name, s_start());
-            let r = self.run_actions(&st.actions, shell);
-            match &r {
-                Ok(()) => log_line(1, "STEP", &st.name, s_ok()),
-                Err(c) => log_line(1, "STEP", &st.name, s_fail(*c)),
-            }
-            last = Some(r);
         }
-        match last {
-            Some(Err(c)) => Err(c),
-            _ => Ok(()),
-        }
-    }
+    });
 
-    fn run_actions(&mut self, acts: &[Action], shell: &mut PersistentShell) -> Result<(), i32> {
-        for a in acts {
-            self.run_one(a, shell)?;
-        }
-        Ok(())
-    }
-
-    fn run_one(&mut self, a: &Action, shell: &mut PersistentShell) -> Result<(), i32> {
-        match (&a.run, &a.builtin) {
-            (Some(script), None) => match shell.run_script(script) {
-                Ok(0) => Ok(()),
-                Ok(c) => Err(c),
-                Err(e) => {
-                    eprintln!("{}[错误] 写 pty 失败: {}{}", color::RED, e, color::RESET);
-                    Err(1)
-                }
-            },
-            (None, Some(bs)) => {
-                let table = builtin_table();
-                for line in bs {
-                    let exp = expand_vars(line, &self.current_args);
-                    let parts = split_quoted(&exp);
-                    if parts.is_empty() {
-                        continue;
-                    }
-                    match table.get(parts[0].as_str()) {
-                        Some(f) => f(self, &parts[1..])?,
-                        None => {
-                            eprintln!("{}[错误] 未知内建: {}{}", color::RED, parts[0], color::RESET);
-                            return Err(127);
+    // ── writer 线程：mlmake 的 stdin → PTY master ──
+    //    Ctrl-] (0x1d) 作为脱离信号，避免交互式程序无法退出。
+    let raw_fd_w = pty.as_raw_fd();
+    let dup_fd_w = unsafe { libc::dup(raw_fd_w) };
+    let _writer_thread = if dup_fd_w >= 0 {
+        let mut writer = unsafe { std::fs::File::from_raw_fd(dup_fd_w) };
+        Some(std::thread::spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 1024];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if buf[..n].contains(&0x1d) {
+                            break;
                         }
+                        if writer.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                        let _ = writer.flush();
                     }
+                    Err(_) => break,
                 }
-                Ok(())
             }
-            _ => {
-                eprintln!("{}[错误] action 只能有 run/builtin 之一{}", color::RED, color::RESET);
-                Err(1)
+        }))
+    } else {
+        None
+    };
+
+    // ── 创建绑定到 PTY 的 shell ──
+    let mut shell = match create_shell_with_pty(args, Some(pts)).await {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("{}[错误] {} {}", color::RED, err, color::RESET);
+            drop(pty);
+            let _ = reader_thread.join();
+            let mut e = engine.lock().await;
+            e.task_depth -= 1;
+            log_line(actioninfo, 0, "TASK", &task.name, s_fail(127));
+            return Err(127);
+        }
+    };
+
+    // ── 跑所有 step ──
+    let result = run_steps(&task.steps, &mut shell, actioninfo).await;
+
+    // ── 清理 ──
+    drop(shell);
+    drop(pty);
+    let _ = reader_thread.join();
+
+    // writer 线程可能仍阻塞在 stdin.read() 上，让它在进程结束时自动消失。
+    if let Some(t) = _writer_thread {
+        let _ = t;
+    }
+
+    // _raw_guard 在此处 drop，恢复终端
+
+    {
+        let mut e = engine.lock().await;
+        e.task_depth -= 1;
+    }
+
+    match &result {
+        Ok(()) => log_line(actioninfo, 0, "TASK", &task.name, s_ok()),
+        Err(c) => log_line(actioninfo, 0, "TASK", &task.name, s_fail(*c)),
+    }
+    result
+}
+
+// ============== 跑步骤 ==============
+async fn run_steps(
+    steps: &[Step],
+    shell: &mut BrushShell,
+    actioninfo: bool,
+) -> Result<(), i32> {
+    let mut last: Option<Result<(), i32>> = None;
+
+    for st in steps {
+        if st.require_success {
+            if let Some(Err(c)) = last {
+                log_line(actioninfo, 1, "STEP", &st.name, s_fail(c));
+                last = Some(Err(c));
+                continue;
             }
+        }
+        log_line(actioninfo, 1, "STEP", &st.name, s_start());
+
+        let r = run_actions(&st.actions, shell).await;
+        match &r {
+            Ok(()) => log_line(actioninfo, 1, "STEP", &st.name, s_ok()),
+            Err(c) => log_line(actioninfo, 1, "STEP", &st.name, s_fail(*c)),
+        }
+        last = Some(r);
+    }
+
+    match last {
+        Some(Err(c)) => Err(c),
+        _ => Ok(()),
+    }
+}
+
+async fn run_actions(acts: &[Action], shell: &mut BrushShell) -> Result<(), i32> {
+    for a in acts {
+        run_one(a, shell).await?;
+    }
+    Ok(())
+}
+
+// ============== run_one：所有命令都通过 PTY 上的 shell 执行 ==============
+async fn run_one(a: &Action, shell: &mut BrushShell) -> Result<(), i32> {
+    let script = a.run.trim();
+
+    let params = ExecutionParameters::default();
+    let result = shell.run_string(script.to_string(), &params).await;
+
+    match result {
+        Ok(exec_result) => {
+            let code = u8::from(exec_result.exit_code) as i32;
+            if code == 0 { Ok(()) } else { Err(code) }
+        }
+        Err(e) => {
+            eprintln!("{}[错误] 执行失败: {}{}", color::RED, e, color::RESET);
+            Err(1)
         }
     }
 }
 
 // ============== 校验 ==============
-
 fn validate(tasks: &[Task]) -> Result<(), String> {
     let mut vals = std::collections::HashSet::new();
     for t in tasks {
@@ -499,33 +611,56 @@ fn validate(tasks: &[Task]) -> Result<(), String> {
             return Err(format!("task value 重复: {}", key));
         }
     }
-    for t in tasks {
-        for s in &t.steps {
-            for a in &s.actions {
-                if let Some(bs) = &a.builtin {
-                    for b in bs {
-                        let p = split_quoted(b);
-                        if !p.is_empty() && p[0] == "task" && p.len() >= 2 && !vals.contains(&p[1]) {
-                            return Err(format!("task `{}` 引用不存在的 task: {}", t.value, p[1]));
-                        }
-                    }
-                }
-            }
-        }
-    }
     Ok(())
 }
 
 // ============== CLI ==============
-
 fn print_help() {
     println!(
-        "{B}mlmake{R} - 常驻 PTY 任务编排器\n\n\
-         用法:\n  mlmake [--cfg <file.toml>] <task> [args...]\n  mlmake [--cfg <file.toml>] list\n  mlmake [--cfg <file.toml>] list all step\n  mlmake help\n\n\
-         选项:\n  --cfg <file.toml>  指定本次使用的构建文件 (默认: build.toml)\n",
+        concat!(
+            "{B}{N}{R} v{V}\n\n",
+            "用法:\n",
+            "  {N} [--cfg <file.toml>] <task> [args...]\n",
+            "  {N} [--cfg <file.toml>] list [all|task] [step]\n",
+            "  {N} [--cfg <file.toml>] task <task> [args...]\n",
+            "  {N} --help|-h\n",
+            "  {N} --version|-V\n\n",
+            "说明:\n",
+            "  每个 task 拥有独立、干净的 shell 实例，cd/export 只影响当前 task。\n",
+            "  同一个 task 的所有命令共享同一个 PTY 终端，stdin/stdout 双向转发，\n",
+            "  支持 read -p、vim、top 等交互式程序。\n",
+            "  交互中按 Ctrl-] 可脱离当前 PTY 会话。\n",
+            "  全局变量池没有任何自动同步：\n",
+            "    写入请用 setallvar <name> <value>\n",
+            "    读取请用 getallvar <name>（会设为当前 shell 变量）\n",
+            "    查看请用 listallvar [-n|-v|-nv]\n\n",
+            "配置 [settings] 项:\n",
+            "  actioninfo = true|false   # 是否输出日志，默认 true\n",
+            "  max_depth  = 64           # 最大递归层数，默认 64；\n",
+            "                            # 设为 false 表示不限制（只允许 false，写 true 会报错）\n",
+        ),
         B = color::BOLD,
-        R = color::RESET
+        R = color::RESET,
+        N = PKG_NAME,
+        V = VERSION,
     );
+}
+
+fn load_build(cfg_path: &str) -> BuildFile {
+    let content = match std::fs::read_to_string(cfg_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{}[错误] 读 {}: {}{}", color::RED, cfg_path, e, color::RESET);
+            std::process::exit(1);
+        }
+    };
+    match toml::from_str(&content) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{}[错误] 解析 toml: {}{}", color::RED, e, color::RESET);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn cmd_list(b: &BuildFile, args: &[String]) {
@@ -569,10 +704,10 @@ fn cmd_list(b: &BuildFile, args: &[String]) {
     std::process::exit(1);
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let mut args: Vec<String> = std::env::args().collect();
 
-    // ★ 新增：解析前置选项 --cfg <file.toml>
     let mut cfg_path = String::from("build.toml");
     if args.len() >= 2 && args[1] == "--cfg" {
         if args.len() < 3 {
@@ -580,38 +715,44 @@ fn main() {
             std::process::exit(1);
         }
         cfg_path = args[2].clone();
-        args.drain(1..3); // 去掉 "--cfg" 与其路径，之后逻辑完全复用
+        args.drain(1..3);
     }
 
-    let content = match std::fs::read_to_string(&cfg_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{}[错误] 读 {}: {}{}", color::RED, cfg_path, e, color::RESET);
-            std::process::exit(1);
-        }
-    };
-    let build: BuildFile = match toml::from_str(&content) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("{}[错误] 解析 toml: {}{}", color::RED, e, color::RESET);
-            std::process::exit(1);
-        }
-    };
-    if let Err(e) = validate(&build.tasks) {
-        eprintln!("{}[错误] {}{}", color::RED, e, color::RESET);
-        std::process::exit(1);
+    if args.get(1).map(|s| s == "--version" || s == "-V").unwrap_or(false) {
+        println!("{} v{}", PKG_NAME, VERSION);
+        return;
+    }
+    if args.get(1).map(|s| s == "--help" || s == "-h").unwrap_or(false) {
+        print_help();
+        return;
     }
     if args.len() < 2 {
         print_help();
         return;
     }
-    match args[1].as_str() {
-        "help" | "-h" | "--help" => { print_help(); return; }
-        "list" => { cmd_list(&build, &args[2..]); return; }
-        _ => {}
+
+    let build = load_build(&cfg_path);
+    if let Err(e) = validate(&build.tasks) {
+        eprintln!("{}[错误] {}{}", color::RED, e, color::RESET);
+        std::process::exit(1);
     }
-    let target = args[1].clone();
-    let task_args = args[2..].to_vec();
+
+    let cmd = args[1].as_str();
+
+    let (target, task_args) = if cmd == "task" {
+        if args.len() < 3 {
+            eprintln!("{}[错误] task 缺少任务名{}", color::RED, color::RESET);
+            std::process::exit(1);
+        }
+        (args[2].clone(), args[3..].to_vec())
+    } else {
+        if cmd == "list" {
+            cmd_list(&build, &args[2..]);
+            return;
+        }
+        (args[1].clone(), args[2..].to_vec())
+    };
+
     let task = match build.tasks.iter().find(|t| t.value == target) {
         Some(t) => t,
         None => {
@@ -626,9 +767,24 @@ fn main() {
         );
         std::process::exit(1);
     }
-    let mut engine = Engine::new(build.tasks).unwrap();
-    std::process::exit(match engine.execute_task(&target, &task_args) {
+
+    let engine = match Engine::new(
+        build.tasks,
+        build.settings.actioninfo,
+        build.settings.max_depth,
+    ) {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("{}[错误] {}{}", color::RED, err, color::RESET);
+            std::process::exit(1);
+        }
+    };
+    let engine_arc = Arc::new(tokio::sync::Mutex::new(engine));
+    let _ = ENGINE.set(engine_arc.clone());
+
+    let code = match execute_task(engine_arc, &target, &task_args).await {
         Ok(()) => 0,
         Err(c) => c.max(1),
-    });
+    };
+    std::process::exit(code);
 }

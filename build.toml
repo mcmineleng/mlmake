@@ -1,83 +1,554 @@
+[settings]
+actioninfo = true
+
 # ============================================================
-# mlmake build.toml
+#  探测（内部，静默）：把 [package].name 读进 BIN 并写入全局池
 # ============================================================
-
-# ------------------------------------------------------------
-# clean - 清理产物
-# ------------------------------------------------------------
 [[task]]
-name = '清理'
-value = 'clean'
-cmduse = true
+name = "探测包名"
+value = "probe"
+cmduse = false
+[task.settings]
+actioninfo = false
 
 [[task.step]]
-name = '清理 cargo 缓存'
+name = "读取包名"
 [[task.step.action]]
 run = '''
-cargo clean
+BIN=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^name[[:space:]]*=/{
+  v=$0; sub(/^name[[:space:]]*=[[:space:]]*/,"",v); gsub(/[" \r]/,"",v); print v; exit }' Cargo.toml)
+if [ -z "$BIN" ]; then
+  echo ":: error :: Cargo.toml 缺少 [package].name"
+  exit 1
+fi
+export BIN
+allvar BIN
+mkdir -p outputs
+'''
+
+# ============================================================
+#  唯一对外入口：mlmake build [<sys> <arch>]
+# ============================================================
+[[task]]
+name = "构建"
+value = "build"
+cmduse = true
+[task.settings]
+actioninfo = false
+
+[[task.step]]
+name = "探测"
+[[task.step.action]]
+run = "task probe"
+
+[[task.step]]
+name = "设平台/架构变量"
+[[task.step.action]]
+run = '''
+P="$1"
+A="$2"
+if [ -z "$P" ]; then
+  export PLAT=current
+  export ARCH=native
+else
+  export PLAT="$P"
+  export ARCH="$A"
+fi
+allvar PLAT ARCH
 '''
 
 [[task.step]]
-name = '删除 release 目录'
+name = "调用 平台.架构"
 [[task.step.action]]
-run = '''
-rm -rf target/release
-'''
+run = "task ${PLAT}.${ARCH}"
 
-# ------------------------------------------------------------
-# debug - 构建 debug 版本（不清理）
-# ------------------------------------------------------------
+# ============================================================
+#  聚合内部任务（cmduse=false）
+# ============================================================
 [[task]]
-name = '调试构建'
-value = 'debug'
+name = "构建"
+value = "linux.all"
+cmduse = false
+[task.settings]
+actioninfo = false
+
+[[task.step]]
+name = "构建 Linux x86_64"
+[[task.step.action]]
+run = "task linux.x86_64"
+
+[[task.step]]
+name = "构建 Linux aarch64"
+[[task.step.action]]
+run = "task linux.aarch64"
+
+[[task.step]]
+name = "构建 Linux armv7"
+[[task.step.action]]
+run = "task linux.armv7"
+
+[[task.step]]
+name = "构建 Linux x86"
+[[task.step.action]]
+run = "task linux.x86"
+
+[[task]]
+name = "构建"
+value = "bsd.all"
+cmduse = false
+[task.settings]
+actioninfo = false
+
+[[task.step]]
+name = "构建 BSD x86_64"
+[[task.step.action]]
+run = "task bsd.x86_64"
+
+[[task.step]]
+name = "构建 BSD aarch64"
+[[task.step.action]]
+run = "task bsd.aarch64"
+
+[[task.step]]
+name = "构建 BSD x86"
+[[task.step.action]]
+run = "task bsd.x86"
+
+[[task]]
+name = "构建"
+value = "android.all"
+cmduse = false
+[task.settings]
+actioninfo = false
+
+[[task.step]]
+name = "构建 Android x86_64"
+[[task.step.action]]
+run = "task android.x86_64"
+
+[[task.step]]
+name = "构建 Android aarch64"
+[[task.step.action]]
+run = "task android.aarch64"
+
+[[task.step]]
+name = "构建 Android armv7"
+[[task.step.action]]
+run = "task android.armv7"
+
+[[task.step]]
+name = "构建 Android x86"
+[[task.step.action]]
+run = "task android.x86"
+
+[[task]]
+name = "构建"
+value = "macos.all"
+cmduse = false
+[task.settings]
+actioninfo = false
+
+[[task.step]]
+name = "构建 macOS aarch64"
+[[task.step.action]]
+run = "task macos.aarch64"
+
+[[task.step]]
+name = "构建 macOS x86_64"
+[[task.step.action]]
+run = "task macos.x86_64"
+
+[[task]]
+name = "构建"
+value = "all.aarch64"
+cmduse = false
+[task.settings]
+actioninfo = false
+
+[[task.step]]
+name = "构建 Linux aarch64"
+[[task.step.action]]
+run = "task linux.aarch64"
+
+[[task.step]]
+name = "构建 BSD aarch64"
+[[task.step.action]]
+run = "task bsd.aarch64"
+
+[[task.step]]
+name = "构建 Android aarch64"
+[[task.step.action]]
+run = "task android.aarch64"
+
+[[task.step]]
+name = "构建 macOS aarch64"
+[[task.step.action]]
+run = "task macos.aarch64"
+
+[[task]]
+name = "构建"
+value = "all.x86_64"
+cmduse = false
+[task.settings]
+actioninfo = false
+
+[[task.step]]
+name = "构建 Linux x86_64"
+[[task.step.action]]
+run = "task linux.x86_64"
+
+[[task.step]]
+name = "构建 BSD x86_64"
+[[task.step.action]]
+run = "task bsd.x86_64"
+
+[[task.step]]
+name = "构建 Android x86_64"
+[[task.step.action]]
+run = "task android.x86_64"
+
+[[task.step]]
+name = "构建 macOS x86_64"
+[[task.step.action]]
+run = "task macos.x86_64"
+
+[[task]]
+name = "构建"
+value = "all.armv7"
+cmduse = false
+[task.settings]
+actioninfo = false
+
+[[task.step]]
+name = "构建 Linux armv7"
+[[task.step.action]]
+run = "task linux.armv7"
+
+[[task.step]]
+name = "构建 Android armv7"
+[[task.step.action]]
+run = "task android.armv7"
+
+[[task]]
+name = "构建"
+value = "all.x86"
+cmduse = false
+[task.settings]
+actioninfo = false
+
+[[task.step]]
+name = "构建 Linux x86"
+[[task.step.action]]
+run = "task linux.x86"
+
+[[task.step]]
+name = "构建 BSD x86"
+[[task.step.action]]
+run = "task bsd.x86"
+
+[[task.step]]
+name = "构建 Android x86"
+[[task.step.action]]
+run = "task android.x86"
+
+[[task]]
+name = "构建"
+value = "all.all"
+cmduse = false
+[task.settings]
+actioninfo = false
+
+[[task.step]]
+name = "构建 Linux 全架构"
+[[task.step.action]]
+run = "task linux.all"
+
+[[task.step]]
+name = "构建 BSD 全架构"
+[[task.step.action]]
+run = "task bsd.all"
+
+[[task.step]]
+name = "构建 Android 全架构"
+[[task.step.action]]
+run = "task android.all"
+
+[[task.step]]
+name = "构建 macOS 全架构"
+[[task.step.action]]
+run = "task macos.all"
+
+# ============================================================
+#  具体编译任务（cmduse=false）
+# ============================================================
+[[task]]
+name = "构建"
+value = "linux.x86_64"
+cmduse = false
+
+[[task.step]]
+name = "构建 Linux x86_64"
+[[task.step.action]]
+run = "cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17"
+
+[[task.step]]
+name = "落盘"
+[[task.step.action]]
+run = "cp target/x86_64-unknown-linux-gnu/release/$BIN outputs/linux.x86_64"
+
+[[task]]
+name = "构建"
+value = "linux.aarch64"
+cmduse = false
+
+[[task.step]]
+name = "构建 Linux aarch64"
+[[task.step.action]]
+run = "cargo build --release --target aarch64-unknown-linux-gnu"
+
+[[task.step]]
+name = "落盘"
+[[task.step.action]]
+run = "cp target/aarch64-unknown-linux-gnu/release/$BIN outputs/linux.aarch64"
+
+[[task]]
+name = "构建"
+value = "linux.armv7"
+cmduse = false
+
+[[task.step]]
+name = "构建 Linux armv7"
+[[task.step.action]]
+run = "cargo zigbuild --release --target armv7-unknown-linux-gnueabihf.2.17"
+
+[[task.step]]
+name = "落盘"
+[[task.step.action]]
+run = "cp target/armv7-unknown-linux-gnueabihf/release/$BIN outputs/linux.armv7"
+
+[[task]]
+name = "构建"
+value = "linux.x86"
+cmduse = false
+
+[[task.step]]
+name = "构建 Linux x86"
+[[task.step.action]]
+run = "cargo zigbuild --release --target i686-unknown-linux-gnu.2.17"
+
+[[task.step]]
+name = "落盘"
+[[task.step.action]]
+run = "cp target/i686-unknown-linux-gnu/release/$BIN outputs/linux.x86"
+
+[[task]]
+name = "构建"
+value = "bsd.x86_64"
+cmduse = false
+
+[[task.step]]
+name = "构建 BSD x86_64"
+[[task.step.action]]
+run = "cargo build --release --target x86_64-unknown-freebsd"
+
+[[task.step]]
+name = "落盘"
+[[task.step.action]]
+run = "cp target/x86_64-unknown-freebsd/release/$BIN outputs/bsd.x86_64"
+
+[[task]]
+name = "构建"
+value = "bsd.aarch64"
+cmduse = false
+
+[[task.step]]
+name = "构建 BSD aarch64"
+[[task.step.action]]
+run = "cargo build --release --target aarch64-unknown-freebsd"
+
+[[task.step]]
+name = "落盘"
+[[task.step.action]]
+run = "cp target/aarch64-unknown-freebsd/release/$BIN outputs/bsd.aarch64"
+
+[[task]]
+name = "构建"
+value = "bsd.x86"
+cmduse = false
+
+[[task.step]]
+name = "构建 BSD x86"
+[[task.step.action]]
+run = "cargo build --release --target i686-unknown-freebsd"
+
+[[task.step]]
+name = "落盘"
+[[task.step.action]]
+run = "cp target/i686-unknown-freebsd/release/$BIN outputs/bsd.x86"
+
+[[task]]
+name = "构建"
+value = "android.x86_64"
+cmduse = false
+
+[[task.step]]
+name = "构建 Android x86_64"
+[[task.step.action]]
+run = "cargo ndk -t x86_64 -p 21 build --release"
+
+[[task.step]]
+name = "落盘"
+[[task.step.action]]
+run = "cp target/x86_64-linux-android/release/$BIN outputs/android.x86_64"
+
+[[task]]
+name = "构建"
+value = "android.aarch64"
+cmduse = false
+
+[[task.step]]
+name = "构建 Android aarch64"
+[[task.step.action]]
+run = "cargo ndk -t arm64-v8a -p 21 build --release"
+
+[[task.step]]
+name = "落盘"
+[[task.step.action]]
+run = "cp target/aarch64-linux-android/release/$BIN outputs/android.aarch64"
+
+[[task]]
+name = "构建"
+value = "android.armv7"
+cmduse = false
+
+[[task.step]]
+name = "构建 Android armv7"
+[[task.step.action]]
+run = "cargo ndk -t armeabi-v7a -p 21 build --release"
+
+[[task.step]]
+name = "落盘"
+[[task.step.action]]
+run = "cp target/armv7-linux-androideabi/release/$BIN outputs/android.armv7"
+
+[[task]]
+name = "构建"
+value = "android.x86"
+cmduse = false
+
+[[task.step]]
+name = "构建 Android x86"
+[[task.step.action]]
+run = "cargo ndk -t x86 -p 21 build --release"
+
+[[task.step]]
+name = "落盘"
+[[task.step.action]]
+run = "cp target/i686-linux-android/release/$BIN outputs/android.x86"
+
+[[task]]
+name = "构建"
+value = "macos.aarch64"
+cmduse = false
+
+[[task.step]]
+name = "构建 macOS aarch64"
+[[task.step.action]]
+run = "cargo build --release --target aarch64-apple-darwin"
+
+[[task.step]]
+name = "落盘"
+[[task.step.action]]
+run = "cp target/aarch64-apple-darwin/release/$BIN outputs/macos.aarch64"
+
+[[task]]
+name = "构建"
+value = "macos.x86_64"
+cmduse = false
+
+[[task.step]]
+name = "构建 macOS x86_64"
+[[task.step.action]]
+run = "cargo build --release --target x86_64-apple-darwin"
+
+[[task.step]]
+name = "落盘"
+[[task.step.action]]
+run = "cp target/x86_64-apple-darwin/release/$BIN outputs/macos.x86_64"
+
+[[task]]
+name = "构建"
+value = "current.native"
+cmduse = false
+
+[[task.step]]
+name = "构建 当前平台 native"
+[[task.step.action]]
+run = "cargo build --release"
+
+[[task.step]]
+name = "落盘"
+[[task.step.action]]
+run = "cp target/release/$BIN outputs/current.native"
+
+# ============================================================
+#  debug / clean
+# ============================================================
+[[task]]
+name = "构建"
+value = "debug"
 cmduse = true
 
 [[task.step]]
-name = '编译 debug'
+name = "构建 debug"
 [[task.step.action]]
-run = '''
-cargo build
-'''
+run = "cargo build"
 
-# ------------------------------------------------------------
-# release - 构建 release 版本（先清理）
-# ------------------------------------------------------------
 [[task]]
-name = '发布构建'
-value = 'release'
+name = "构建"
+value = "clean"
+cmduse = true
+[task.settings]
+actioninfo = false
+
+[[task.step]]
+name = "清空 outputs"
+[[task.step.action]]
+run = "rm -rf outputs && mkdir -p outputs && echo cleared"
+
+# ============================================================
+#  安装：install 干活；i / inst 是静默别名
+# ============================================================
+[[task]]
+name = "安装"
+value = "install"
 cmduse = true
 
 [[task.step]]
-name = '清理'
-require_success = true
+name = "安装到本地目录"
 [[task.step.action]]
-builtin = ['task clean']
+run = "cargo install --path . --force"
 
-[[task.step]]
-name = '编译 release'
-require_success = true
-[[task.step.action]]
-run = '''
-cargo build --release
-'''
-
-# ------------------------------------------------------------
-# build - 同时构建 debug 和 release
-# ------------------------------------------------------------
 [[task]]
-name = '完整构建'
-value = 'build'
+name = "安装"
+value = "i"
 cmduse = true
+[task.settings]
+actioninfo = false
 
 [[task.step]]
-name = '调试构建'
-require_success = true
+name = "转调用 install"
 [[task.step.action]]
-builtin = ['task debug']
+run = "task install"
+
+[[task]]
+name = "安装"
+value = "inst"
+cmduse = true
+[task.settings]
+actioninfo = false
 
 [[task.step]]
-name = '发布构建'
-require_success = true
+name = "转调用 install"
 [[task.step.action]]
-builtin = ['task release']
-
+run = "task install"

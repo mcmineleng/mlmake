@@ -1,14 +1,26 @@
 [package]
 name = "mlmake"
-version = "0.1.0"
-edition = "2024"
-
-[[bin]]
-name = "mlmake"
-path = "src/main.rs"
+version = "0.1.2"
+edition = "2021"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+brush-core = "0.4"
+brush-builtins = "0.1"
 toml = "0.8"
-portable-pty = "0.8"
-libc = "0.2.190"
+serde = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+pty-process = "0.5"
+libc = "0.2"
+crossterm = "0.28"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1
+debug = true

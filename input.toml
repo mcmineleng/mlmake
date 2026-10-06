@@ -1,0 +1,34 @@
+[settings]
+actioninfo = false
+
+[[task]]
+name = "测试 query 和 cd"
+value = 'test'
+cmduse = true
+
+  [[task.step]]
+  name = '询问用户'
+
+    [[task.step.action]]
+    # 原: builtin = ["query '请输入名字: ' USER_NAME"]
+    # 改为 bash 标准交互读入。read -p 会把提示打到 stderr，
+    # 在 PTY 上表现与交互 shell 一致。
+    run = "read -p '请输入名字: ' USER_NAME"
+
+  [[task.step]]
+  name = '切目录'
+
+    [[task.step.action]]
+    # 原: builtin = ["cd /tmp"]
+    # cd 是 shell 内建命令，直接 run 即可。
+    # 同一个 task 共用一个 shell 实例，所以这里的 cd 会持续到下一步。
+    run = "cd /tmp"
+
+  [[task.step]]
+  name = '在 shell 里验证 cwd 和 query 变量'
+
+    [[task.step.action]]
+    run = '''
+    echo "cwd = $(pwd)"
+    echo "USER_NAME = $USER_NAME"
+    '''
